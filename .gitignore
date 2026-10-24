@@ -32,3 +32,6 @@ Thumbs.db
 campus.db
 data/
 model_cache/
+
+campus_demo.db
+*.db
