@@ -5,11 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>EduCare | Student Success Platform</title>
   <meta name="description" content="EduCare: A simple, clear student success dashboard for college faculty, administrators, and students to track learning and support needs.">
-  <link rel="stylesheet" href="/static/css/style.css?v=sidebar-nav-20261024">
+  <link rel="stylesheet" href="/static/css/style.css?v=account-approval-demo-20261024">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
   <div id="app-container">
+    <button type="button" class="sidebar-scrim" id="sidebar-scrim" aria-label="Close navigation"></button>
+    <button type="button" class="sidebar-toggle" id="sidebar-toggle" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
     <!-- Clean Sidebar -->
     <aside class="sidebar" id="sidebar">
       <div class="sidebar-header">
@@ -58,55 +62,113 @@
     </div>
   </div>
 
-  <!-- Login Modal in Plain Language -->
+  <!-- Full-page sign-in and account-request screen -->
   <div class="login-backdrop" id="login-modal" style="display: none;">
     <div class="login-card">
-      <div class="institutional-badge login-brand">EduCare · Student Success</div>
-      <div id="login-panel">
-      <h2>Sign in to your account</h2>
-      <p>A simple portal for teachers, administrators, and students to track learning progress.</p>
-
-      <form id="login-form">
-        <div class="form-group">
-          <label for="login-username">Username or Roll Number</label>
-          <input type="text" id="login-username" class="form-control" placeholder="Enter your username or roll number" required autofocus>
-        </div>
-
-        <div class="form-group">
-          <label for="login-password">Password</label>
-          <input type="password" id="login-password" class="form-control" placeholder="Enter password" required>
-        </div>
-
-        <button type="submit" class="btn-primary" id="btn-login-submit">Sign In</button>
-      </form>
-
-      <div id="login-error-msg" style="color: var(--status-urgent); font-size: 13px; margin-top: 12px; display: none;"></div>
-      <div class="login-divider">
-        <button class="btn-outline" type="button" id="google-signin" disabled>Continue with Google</button>
-        <p class="oauth-setup-note">Google sign-in is unavailable until server-side OAuth is configured.</p>
-      </div>
-      <p class="login-switch">New student? <button type="button" class="link-button" id="show-register">Create an account</button></p>
-      </div>
-
-      <section id="registration-panel" hidden>
-        <h2>Request a student account</h2>
-        <p>Requests are limited to existing student records and require administrator approval.</p>
-        <form id="register-form">
-          <div class="form-group">
-            <label for="register-student-id">Student ID / Roll Number</label>
-            <input type="text" id="register-student-id" class="form-control" autocomplete="username" required minlength="3" maxlength="50">
+      <aside class="login-brand-panel">
+        <div class="login-logo-mark" aria-hidden="true">E</div>
+        <div class="login-brand-name">EduCare</div>
+        <p class="login-tagline">A brighter path to student success.</p>
+        <ul class="login-feature-list">
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5m0 14h16M7 15l4-5 3 3 5-7"/></svg><span>Track progress that matters</span></li>
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 20 6v5c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-3Z"/><path d="m9 12 2 2 4-4"/></svg><span>Support every learner</span></li>
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 11a4 4 0 0 0 0-7m1 11a7 7 0 0 1 4 6"/></svg><span>Bring your campus together</span></li>
+        </ul>
+      </aside>
+      <div class="login-form-panel">
+        <div class="institutional-badge login-brand">EDUCARE · STUDENT SUCCESS</div>
+        <div id="login-panel">
+          <h2>Welcome back</h2>
+          <p>Sign in to continue to your student success portal.</p>
+          <div id="login-error-msg" class="login-info-banner" role="status" aria-live="polite" hidden></div>
+          <form id="login-form">
+            <div class="form-group">
+              <label for="login-username">Username or Roll Number</label>
+              <input type="text" id="login-username" class="form-control" placeholder="Enter your username or roll number" autocomplete="username" required autofocus>
+            </div>
+            <div class="form-group">
+              <label for="login-password">Password</label>
+              <input type="password" id="login-password" class="form-control" placeholder="Enter password" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn-primary" id="btn-login-submit">Sign In</button>
+          </form>
+          <div class="login-divider">
+            <button class="btn-outline" type="button" id="google-signin" disabled>Continue with Google</button>
+            <p class="oauth-setup-note">Google sign-in is unavailable until server-side OAuth is configured.</p>
           </div>
-          <div class="form-group">
-            <label for="register-password">Password</label>
-            <input type="password" id="register-password" class="form-control" autocomplete="new-password" required minlength="12" maxlength="72">
-            <small>Use at least 12 characters. Your account will be available after review.</small>
+          <p class="login-switch">New to EduCare? <button type="button" class="link-button" id="show-register">Request an account</button></p>
+        </div>
+        <section id="registration-panel" hidden>
+          <div id="registration-form-view">
+            <h2>Request an account</h2>
+            <p>An administrator will review your request before access is granted.</p>
+            <div class="account-role-toggle" role="group" aria-label="Choose account type">
+              <button type="button" class="account-role-option active" data-account-role="STUDENT" aria-pressed="true">Student</button>
+              <button type="button" class="account-role-option" data-account-role="FACULTY" aria-pressed="false">Faculty</button>
+            </div>
+            <form id="register-form" novalidate>
+              <div class="form-group" data-student-field>
+                <label for="register-student-id">Student ID / Roll Number</label>
+                <input type="text" id="register-student-id" class="form-control" autocomplete="username" minlength="3" maxlength="50" required>
+                <small class="field-error" id="student-id-error"></small>
+              </div>
+              <div class="form-group faculty-field" data-faculty-field hidden>
+                <label for="register-name">Full name</label>
+                <input type="text" id="register-name" class="form-control" autocomplete="name" minlength="2" maxlength="100">
+                <small class="field-error" id="register-name-error"></small>
+              </div>
+              <div class="form-group faculty-field" data-faculty-field hidden>
+                <label for="register-email">Email</label>
+                <input type="email" id="register-email" class="form-control" autocomplete="email" maxlength="120">
+                <small class="field-error" id="register-email-error"></small>
+              </div>
+              <div class="form-group faculty-field" data-faculty-field hidden>
+                <label for="register-department">Department</label>
+                <input type="text" id="register-department" class="form-control" maxlength="50">
+                <small class="field-error" id="register-department-error"></small>
+              </div>
+              <div class="form-group faculty-field" data-faculty-field hidden>
+                <label for="register-username">Username</label>
+                <input type="text" id="register-username" class="form-control" autocomplete="username" minlength="3" maxlength="50">
+                <small class="field-error" id="register-username-error"></small>
+              </div>
+              <div class="form-group">
+                <label for="register-password">Password</label>
+                <input type="password" id="register-password" class="form-control" autocomplete="new-password" minlength="12" required>
+                <small class="password-help">Use at least 12 characters.</small>
+                <small class="field-error" id="register-password-error"></small>
+              </div>
+              <div id="registration-error-msg" class="registration-error" role="alert" aria-live="assertive"></div>
+              <button type="submit" class="btn-primary" id="btn-register-submit">Send account request</button>
+            </form>
+            <p class="login-switch">Already have an account? <button type="button" class="link-button" id="show-login">Sign in</button></p>
           </div>
-          <button type="submit" class="btn-primary" id="btn-register-submit" style="width: 100%; padding: 11px;">Request Student Account</button>
-        </form>
-        <div id="registration-error-msg" role="status" aria-live="polite"></div>
-        <p class="login-switch">Already have an account? <button type="button" class="link-button" id="show-login">Sign in</button></p>
-      </section>
+          <div id="registration-success" class="registration-success" hidden>
+            <div class="success-icon" aria-hidden="true">✓</div>
+            <h2>Request received</h2>
+            <p>Request sent. An administrator will review it. You can sign in once it is approved.</p>
+            <button type="button" class="btn-primary" id="registration-success-login">Back to sign in</button>
+          </div>
+        </div>
+      </div>
     </div>
+  </div>
+
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <div class="modal-backdrop" id="reject-modal" hidden>
+    <section class="small-modal" role="dialog" aria-modal="true" aria-labelledby="reject-modal-title">
+      <button type="button" class="modal-close" id="reject-modal-close" aria-label="Close dialog">&times;</button>
+      <h2 id="reject-modal-title">Reject account request</h2>
+      <p>You may include a short reason. The applicant will see it when they try to sign in.</p>
+      <form id="reject-form">
+        <label for="reject-reason">Reason (optional)</label>
+        <textarea id="reject-reason" class="form-control" rows="3" maxlength="500"></textarea>
+        <div class="modal-actions">
+          <button type="button" class="btn-outline" id="reject-cancel">Cancel</button>
+          <button type="submit" class="btn-danger">Reject request</button>
+        </div>
+      </form>
+    </section>
   </div>
 
   <script type="module" src="/static/js/app.js"></script>

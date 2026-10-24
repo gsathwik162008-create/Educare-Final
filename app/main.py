@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from app.database import engine, Base
+from app.database import engine, Base, SessionLocal
+from app.models import AccountRequest, Student, StudentAccountRequest
 from app.routes_auth import router as auth_router
 from app.routes_students import router as students_router
 from app.routes_analytics import router as analytics_router
@@ -27,6 +28,35 @@ if "*" in cors_origins:
 
 # Ensure tables exist
 Base.metadata.create_all(bind=engine)
+
+def migrate_student_account_requests():
+    with SessionLocal() as db:
+        legacy_requests = db.query(StudentAccountRequest).all()
+        for legacy in legacy_requests:
+            if db.query(AccountRequest.id).filter(
+                AccountRequest.legacy_request_id == legacy.id
+            ).first():
+                continue
+            student = db.query(Student).filter(
+                Student.student_id == legacy.student_id
+            ).first()
+            db.add(AccountRequest(
+                legacy_request_id=legacy.id,
+                role="STUDENT",
+                student_id=legacy.student_id,
+                name=student.name if student else legacy.student_id,
+                email=student.email if student else None,
+                department=student.department if student else "",
+                requested_username=legacy.student_id,
+                hashed_password=legacy.hashed_password,
+                status=legacy.status,
+                created_at=legacy.created_at,
+                reviewed_at=legacy.reviewed_at,
+            ))
+        db.commit()
+
+
+migrate_student_account_requests()
 
 intervention_columns = {
     column["name"] for column in inspect(engine).get_columns("intervention_actions")

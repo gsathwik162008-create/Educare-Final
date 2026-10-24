@@ -17,9 +17,11 @@ Anyone can understand each screen in 5 seconds without data expertise.
 ## Account access
 
 Students can submit an account request only for a student record already present
-in the database. Requests remain pending until an administrator approves them;
-public registration cannot create administrator or faculty accounts. Authorized
-staff accounts must be provisioned through a trusted administrative process.
+in the database. Faculty can submit a request with their name, email, department,
+and requested username. Both student and faculty requests remain pending until
+an administrator approves them; no account is created before approval. Public
+registration cannot create administrator accounts. Legacy student requests are
+migrated to the generalized account-request queue at startup.
 Do not use published or shared demo credentials in a deployment.
 
 Signing out clears the browser's authenticated state and revokes the current

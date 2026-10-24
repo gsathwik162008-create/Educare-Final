@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy import Column, Index, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, text
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -29,6 +29,41 @@ class StudentAccountRequest(Base):
     status = Column(String(20), nullable=False, default="pending")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     reviewed_at = Column(DateTime, nullable=True)
+
+
+class AccountRequest(Base):
+    __tablename__ = "account_requests"
+    __table_args__ = (
+        Index(
+            "uq_account_requests_pending_username",
+            text("lower(requested_username)"),
+            unique=True,
+            sqlite_where=text("status = 'pending'"),
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "uq_account_requests_pending_faculty_email",
+            text("lower(email)"),
+            unique=True,
+            sqlite_where=text("status = 'pending' AND role = 'FACULTY' AND email IS NOT NULL"),
+            postgresql_where=text("status = 'pending' AND role = 'FACULTY' AND email IS NOT NULL"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    legacy_request_id = Column(Integer, unique=True, nullable=True, index=True)
+    role = Column(String(20), nullable=False, default="STUDENT", index=True)
+    student_id = Column(String(50), nullable=True, index=True)
+    name = Column(String(100), nullable=False)
+    email = Column(String(120), nullable=True, index=True)
+    department = Column(String(50), nullable=False)
+    requested_username = Column(String(50), nullable=False, index=True)
+    hashed_password = Column(String(255), nullable=False)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    reviewed_at = Column(DateTime, nullable=True)
+    reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reject_reason = Column(Text, nullable=True)
 
 
 class RevokedToken(Base):

@@ -75,12 +75,18 @@ export async function apiRequest(endpoint, options = {}) {
 
         if (response.status === 403) {
             const errData = await response.json().catch(() => ({}));
-            throw new Error(formatApiError(errData, "Access forbidden for your user role."));
+            const error = new Error(formatApiError(errData, "Access forbidden for your user role."));
+            error.status = response.status;
+            error.detail = errData.detail;
+            throw error;
         }
 
         if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
-            throw new Error(formatApiError(errData, `Request failed with status ${response.status}`));
+            const error = new Error(formatApiError(errData, `Request failed with status ${response.status}`));
+            error.status = response.status;
+            error.detail = errData.detail;
+            throw error;
         }
 
         const contentType = response.headers.get("content-type");
@@ -120,9 +126,13 @@ export function getCurrentUser() {
 }
 
 export function requestStudentAccount(studentId, password) {
-    return apiRequest("/api/auth/student-account-requests", {
+    return requestAccount({ role: "STUDENT", student_id: studentId, password });
+}
+
+export function requestAccount(accountRequest) {
+    return apiRequest("/api/auth/account-requests", {
         method: "POST",
-        body: JSON.stringify({ student_id: studentId, password })
+        body: JSON.stringify(accountRequest)
     });
 }
 
@@ -241,12 +251,30 @@ export function getModelMetrics() {
 }
 
 export function getStudentAccountRequests() {
-    return apiRequest("/api/admin/account-requests");
+    return getAccountRequests();
 }
 
 export function reviewStudentAccountRequest(requestId, decision) {
+    return reviewAccountRequest(requestId, decision);
+}
+
+export function getAccountRequests(filters = {}) {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+        if (value) params.set(key, value);
+    });
+    const query = params.toString();
+    return apiRequest(`/api/admin/account-requests${query ? `?${query}` : ""}`);
+}
+
+export function getAccountRequestCount() {
+    return apiRequest("/api/admin/account-requests/count");
+}
+
+export function reviewAccountRequest(requestId, decision, reason) {
     return apiRequest(`/api/admin/account-requests/${requestId}/${decision}`, {
-        method: "POST"
+        method: "POST",
+        ...(decision === "reject" ? { body: JSON.stringify({ reason: reason || null }) } : {})
     });
 }
 

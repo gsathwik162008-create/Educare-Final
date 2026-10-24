@@ -2,10 +2,10 @@ import io
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from app.database import get_db
 from app.models import (
@@ -13,7 +13,7 @@ from app.models import (
     ScoreSettings,
     CleaningLog,
     Student,
-    StudentAccountRequest,
+    AccountRequest,
     StudentScore,
 )
 from app.auth import get_current_user, require_role
@@ -72,33 +72,69 @@ class SettingsUpdate(BaseModel):
     threshold_coding_score: float = Field(..., ge=0, le=100)
 
 
+class AccountRequestRejection(BaseModel):
+    reason: str | None = Field(None, max_length=500)
+
+
 @router.get("/account-requests")
-def list_student_account_requests(
+def list_account_requests(
+    status_filter: str | None = Query(None, alias="status"),
+    role: str | None = None,
+    search: str | None = None,
     current_user: User = Depends(require_role(["ADMIN"])),
     db: Session = Depends(get_db),
 ):
-    requests = db.query(StudentAccountRequest).filter(
-        StudentAccountRequest.status == "pending"
-    ).order_by(StudentAccountRequest.created_at.asc()).all()
-    students = {
-        student.student_id: student
-        for student in db.query(Student).filter(
-            Student.student_id.in_([request.student_id for request in requests])
-        ).all()
-    }
+    query = db.query(AccountRequest)
+    if status_filter:
+        normalized_status = status_filter.strip().lower()
+        if normalized_status not in {"pending", "approved", "rejected"}:
+            raise HTTPException(status_code=422, detail="Status must be pending, approved, or rejected.")
+        query = query.filter(AccountRequest.status == normalized_status)
+    if role:
+        normalized_role = role.strip().upper()
+        if normalized_role not in {"STUDENT", "FACULTY"}:
+            raise HTTPException(status_code=422, detail="Role must be STUDENT or FACULTY.")
+        query = query.filter(AccountRequest.role == normalized_role)
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        query = query.filter(or_(
+            AccountRequest.name.ilike(term),
+            AccountRequest.email.ilike(term),
+            AccountRequest.department.ilike(term),
+            AccountRequest.student_id.ilike(term),
+            AccountRequest.requested_username.ilike(term),
+        ))
+    requests = query.order_by(AccountRequest.created_at.desc()).all()
     return {
         "requests": [
             {
-                "id": request.id,
-                "student_id": request.student_id,
-                "student_name": students[request.student_id].name,
-                "department": students[request.student_id].department,
-                "created_at": request.created_at.isoformat() if request.created_at else None,
+                "id": account_request.id,
+                "role": account_request.role,
+                "name": account_request.name,
+                "student_id": account_request.student_id,
+                "requested_username": account_request.requested_username,
+                "email": account_request.email,
+                "department": account_request.department,
+                "status": account_request.status,
+                "reject_reason": account_request.reject_reason,
+                "created_at": account_request.created_at.isoformat() if account_request.created_at else None,
+                "reviewed_at": account_request.reviewed_at.isoformat() if account_request.reviewed_at else None,
+                "student_name": account_request.name,
             }
-            for request in requests
-            if request.student_id in students
+            for account_request in requests
         ]
     }
+
+
+@router.get("/account-requests/count")
+def count_pending_account_requests(
+    current_user: User = Depends(require_role(["ADMIN"])),
+    db: Session = Depends(get_db),
+):
+    count = db.query(func.count(AccountRequest.id)).filter(
+        AccountRequest.status == "pending"
+    ).scalar() or 0
+    return {"count": count}
 
 
 @router.post("/account-requests/{request_id}/approve")
@@ -107,46 +143,71 @@ def approve_student_account_request(
     current_user: User = Depends(require_role(["ADMIN"])),
     db: Session = Depends(get_db),
 ):
-    account_request = db.query(StudentAccountRequest).filter(
-        StudentAccountRequest.id == request_id,
-        StudentAccountRequest.status == "pending",
+    account_request = db.query(AccountRequest).filter(
+        AccountRequest.id == request_id,
+        AccountRequest.status == "pending",
     ).first()
     if not account_request:
         raise HTTPException(status_code=404, detail="Pending account request not found.")
-    if db.query(User.id).filter(
-        (User.username == account_request.student_id)
-        | (User.student_id == account_request.student_id)
-    ).first():
-        raise HTTPException(status_code=409, detail="An account already exists for this student.")
-
-    db.add(User(
-        username=account_request.student_id,
-        hashed_password=account_request.hashed_password,
-        role="STUDENT",
-        student_id=account_request.student_id,
-    ))
+    if account_request.role == "STUDENT":
+        existing_user = db.query(User.id).filter(or_(
+            func.lower(User.username) == account_request.requested_username.lower(),
+            User.student_id == account_request.student_id,
+        )).first()
+        if not account_request.student_id or existing_user is not None:
+            raise HTTPException(status_code=409, detail="An account already exists for this student.")
+        user = User(
+            username=account_request.requested_username,
+            hashed_password=account_request.hashed_password,
+            role="STUDENT",
+            student_id=account_request.student_id,
+        )
+    else:
+        existing_user = db.query(User.id).filter(or_(
+            func.lower(User.username) == account_request.requested_username.lower(),
+            func.lower(User.email) == (account_request.email or "").lower(),
+        )).first()
+        if existing_user:
+            raise HTTPException(status_code=409, detail="An account already exists for this username or email.")
+        user = User(
+            username=account_request.requested_username,
+            hashed_password=account_request.hashed_password,
+            role="FACULTY",
+            faculty_name=account_request.name,
+            email=account_request.email,
+        )
+    db.add(user)
     account_request.status = "approved"
     account_request.reviewed_at = datetime.now(timezone.utc)
+    account_request.reviewed_by = current_user.id
     db.commit()
-    return {"status": "approved", "student_id": account_request.student_id}
+    return {
+        "status": "approved",
+        "role": account_request.role,
+        "student_id": account_request.student_id,
+        "username": account_request.requested_username,
+    }
 
 
 @router.post("/account-requests/{request_id}/reject")
 def reject_student_account_request(
     request_id: int,
+    payload: AccountRequestRejection | None = None,
     current_user: User = Depends(require_role(["ADMIN"])),
     db: Session = Depends(get_db),
 ):
-    account_request = db.query(StudentAccountRequest).filter(
-        StudentAccountRequest.id == request_id,
-        StudentAccountRequest.status == "pending",
+    account_request = db.query(AccountRequest).filter(
+        AccountRequest.id == request_id,
+        AccountRequest.status == "pending",
     ).first()
     if not account_request:
         raise HTTPException(status_code=404, detail="Pending account request not found.")
     account_request.status = "rejected"
     account_request.reviewed_at = datetime.now(timezone.utc)
+    account_request.reviewed_by = current_user.id
+    account_request.reject_reason = (payload.reason or "").strip() or None if payload else None
     db.commit()
-    return {"status": "rejected"}
+    return {"status": "rejected", "reason": account_request.reject_reason}
 
 
 @router.get("/settings")

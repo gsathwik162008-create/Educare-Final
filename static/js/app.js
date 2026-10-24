@@ -9,7 +9,7 @@ import {
     login,
     logout,
     getCurrentUser,
-    requestStudentAccount,
+    requestAccount,
     getOverview,
     getTrends,
     getStudents,
@@ -27,8 +27,9 @@ import {
     recomputeAnalytics,
     getDataQualityLog,
     getModelMetrics,
-    getStudentAccountRequests,
-    reviewStudentAccountRequest,
+    getAccountRequests,
+    getAccountRequestCount,
+    reviewAccountRequest,
     uploadCsvFiles,
     getExplain,
     askCampusAI
@@ -55,6 +56,20 @@ import { escapeHtml } from "./security.js";
 
 // Active Chart.js instances registry for proper teardown
 let activeCharts = [];
+let accountRequestRefreshTimer = null;
+let pendingRejectRequestId = null;
+let rejectModalTrigger = null;
+
+function showToast(message, type = "success") {
+    const region = document.getElementById("toast-region");
+    if (!region) return;
+    const toast = document.createElement("div");
+    toast.className = `toast toast-${type}`;
+    toast.setAttribute("role", type === "error" ? "alert" : "status");
+    toast.textContent = message;
+    region.append(toast);
+    window.setTimeout(() => toast.remove(), 4200);
+}
 
 function destroyActiveCharts() {
     activeCharts.forEach(c => {
@@ -227,6 +242,45 @@ async function initAuthAndNavigation() {
     const registrationForm = document.getElementById("register-form");
     const loginPanel = document.getElementById("login-panel");
     const registrationPanel = document.getElementById("registration-panel");
+    const registrationFormView = document.getElementById("registration-form-view");
+    const registrationSuccess = document.getElementById("registration-success");
+    const registerPassword = document.getElementById("register-password");
+    let registrationRole = "STUDENT";
+
+    const setRegistrationRole = role => {
+        registrationRole = role;
+        document.querySelectorAll(".account-role-option").forEach(button => {
+            const selected = button.dataset.accountRole === role;
+            button.classList.toggle("active", selected);
+            button.setAttribute("aria-pressed", String(selected));
+        });
+        document.querySelectorAll("[data-student-field]").forEach(field => {
+            field.hidden = role !== "STUDENT";
+        });
+        document.querySelectorAll("[data-faculty-field]").forEach(field => {
+            field.hidden = role !== "FACULTY";
+            const input = field.querySelector("input");
+            input.required = role === "FACULTY";
+            if (role !== "FACULTY") {
+                input.value = "";
+                input.removeAttribute("aria-invalid");
+            }
+        });
+        document.getElementById("register-student-id").required = role === "STUDENT";
+        document.getElementById("register-student-id").value = "";
+        document.getElementById("registration-error-msg").textContent = "";
+        document.querySelectorAll(".field-error").forEach(error => { error.textContent = ""; });
+        document.getElementById("btn-register-submit").textContent =
+            role === "FACULTY" ? "Request faculty account" : "Request student account";
+    };
+
+    const setFieldError = (fieldId, message) => {
+        const input = document.getElementById(fieldId);
+        const errorId = fieldId === "register-student-id" ? "student-id-error" : `${fieldId}-error`;
+        const error = document.getElementById(errorId);
+        input.toggleAttribute("aria-invalid", Boolean(message));
+        if (error) error.textContent = message;
+    };
 
     window.addEventListener("educare:session-ended", showSignedOutScreen);
     window.addEventListener("storage", event => {
@@ -238,13 +292,23 @@ async function initAuthAndNavigation() {
     window.addEventListener("popstate", () => {
         if (!authState.token) showSignedOutScreen();
     });
+    const sidebar = document.getElementById("sidebar");
+    const sidebarToggle = document.getElementById("sidebar-toggle");
+    sidebarToggle.addEventListener("click", () => {
+        const expanded = sidebar.classList.toggle("sidebar-open");
+        document.body.classList.toggle("sidebar-menu-open", expanded);
+        sidebarToggle.setAttribute("aria-expanded", String(expanded));
+        sidebarToggle.setAttribute("aria-label", expanded ? "Close navigation" : "Open navigation");
+    });
+    document.getElementById("sidebar-scrim").addEventListener("click", closeMobileSidebar);
 
     loginForm.addEventListener("submit", async event => {
         event.preventDefault();
         const errEl = document.getElementById("login-error-msg");
         const submit = document.getElementById("btn-login-submit");
         errEl.textContent = "";
-        errEl.style.display = "none";
+        errEl.hidden = true;
+        errEl.classList.remove("is-rejected");
         submit.disabled = true;
         submit.textContent = "Signing in...";
         try {
@@ -255,7 +319,10 @@ async function initAuthAndNavigation() {
             await enterAuthenticatedApp();
         } catch (err) {
             errEl.textContent = err.message || "Invalid username or password.";
-            errEl.style.display = "block";
+            errEl.hidden = false;
+            if (!err.message?.includes("waiting for admin approval")) {
+                errEl.classList.add("is-rejected");
+            }
         } finally {
             submit.disabled = false;
             submit.textContent = "Sign In";
@@ -266,36 +333,162 @@ async function initAuthAndNavigation() {
     document.getElementById("show-register").addEventListener("click", () => {
         loginPanel.hidden = true;
         registrationPanel.hidden = false;
+        registrationFormView.hidden = false;
+        registrationSuccess.hidden = true;
+        setRegistrationRole("STUDENT");
         document.getElementById("registration-error-msg").textContent = "";
     });
     document.getElementById("show-login").addEventListener("click", () => {
         registrationPanel.hidden = true;
         loginPanel.hidden = false;
     });
+    document.getElementById("registration-success-login").addEventListener("click", () => {
+        registrationPanel.hidden = true;
+        loginPanel.hidden = false;
+    });
+    document.querySelectorAll(".account-role-option").forEach(button => {
+        button.addEventListener("click", () => setRegistrationRole(button.dataset.accountRole));
+    });
     registrationForm.addEventListener("submit", async event => {
         event.preventDefault();
         const submit = document.getElementById("btn-register-submit");
         const message = document.getElementById("registration-error-msg");
+        const studentId = document.getElementById("register-student-id").value.trim();
+        const name = document.getElementById("register-name").value.trim();
+        const email = document.getElementById("register-email").value.trim();
+        const department = document.getElementById("register-department").value.trim();
+        const username = document.getElementById("register-username").value.trim();
+        const password = registerPassword.value;
+        message.textContent = "";
+        document.querySelectorAll(".field-error").forEach(error => { error.textContent = ""; });
+        const errors = [];
+        if (registrationRole === "STUDENT" && studentId.length < 3) {
+            setFieldError("register-student-id", "Enter a valid student ID (at least 3 characters).");
+            errors.push(true);
+        }
+        if (registrationRole === "FACULTY") {
+            if (name.length < 2) {
+                setFieldError("register-name", "Enter your full name.");
+                errors.push(true);
+            }
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                setFieldError("register-email", "Enter a valid email address.");
+                errors.push(true);
+            }
+            if (!department) {
+                setFieldError("register-department", "Enter your department.");
+                errors.push(true);
+            }
+            if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{2,49}$/.test(username)) {
+                setFieldError("register-username", "Use 3-50 letters, numbers, dots, dashes, or underscores.");
+                errors.push(true);
+            }
+        }
+        const passwordBytes = new TextEncoder().encode(password).length;
+        if (Array.from(password).length < 12 || passwordBytes > 72) {
+            setFieldError("register-password", "Password must be at least 12 characters and at most 72 UTF-8 bytes.");
+            errors.push(true);
+        }
+        if (errors.length) return;
+
         submit.disabled = true;
         submit.textContent = "Submitting...";
-        message.textContent = "";
         try {
-            const result = await requestStudentAccount(
-                document.getElementById("register-student-id").value.trim(),
-                document.getElementById("register-password").value
-            );
-            message.textContent = result.message;
+            const payload = registrationRole === "STUDENT"
+                ? { role: "STUDENT", student_id: studentId, password }
+                : { role: "FACULTY", name, email, department, username, password };
+            await requestAccount(payload);
             registrationForm.reset();
+            registrationFormView.hidden = true;
+            registrationSuccess.hidden = false;
         } catch (err) {
             message.textContent = err.message;
         } finally {
             submit.disabled = false;
-            submit.textContent = "Request Student Account";
+            submit.textContent = registrationRole === "FACULTY"
+                ? "Request faculty account"
+                : "Request student account";
         }
     });
+    registerPassword.addEventListener("input", () => setFieldError("register-password", ""));
+
+    document.getElementById("reject-modal-close").addEventListener("click", closeRejectModal);
+    document.getElementById("reject-cancel").addEventListener("click", closeRejectModal);
+    document.getElementById("reject-modal").addEventListener("click", event => {
+        if (event.target.id === "reject-modal") closeRejectModal();
+    });
+    document.addEventListener("keydown", event => {
+        const modal = document.getElementById("reject-modal");
+        if (!modal.hidden) {
+            if (event.key === "Escape") {
+                closeRejectModal();
+            } else if (event.key === "Tab") {
+                const focusable = [...modal.querySelectorAll(
+                    'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
+                )];
+                const first = focusable[0];
+                const last = focusable[focusable.length - 1];
+                if (event.shiftKey && document.activeElement === first) {
+                    event.preventDefault();
+                    last.focus();
+                } else if (!event.shiftKey && document.activeElement === last) {
+                    event.preventDefault();
+                    first.focus();
+                }
+            }
+        }
+    });
+    document.getElementById("reject-form").addEventListener("submit", submitRejectRequest);
 
     showSignedOutScreen();
     await validateStoredSession();
+}
+
+function closeRejectModal() {
+    const modal = document.getElementById("reject-modal");
+    modal.hidden = true;
+    pendingRejectRequestId = null;
+    if (rejectModalTrigger && document.contains(rejectModalTrigger)) rejectModalTrigger.focus();
+    rejectModalTrigger = null;
+}
+
+function openRejectModal(requestId) {
+    rejectModalTrigger = document.activeElement;
+    pendingRejectRequestId = requestId;
+    const modal = document.getElementById("reject-modal");
+    modal.hidden = false;
+    document.getElementById("reject-reason").value = "";
+    document.getElementById("reject-reason").focus();
+}
+
+function closeMobileSidebar() {
+    document.getElementById("sidebar").classList.remove("sidebar-open");
+    document.body.classList.remove("sidebar-menu-open");
+    document.getElementById("sidebar-toggle").setAttribute("aria-expanded", "false");
+    document.getElementById("sidebar-toggle").setAttribute("aria-label", "Open navigation");
+}
+
+async function submitRejectRequest(event) {
+    event.preventDefault();
+    if (!pendingRejectRequestId) return;
+    const requestId = pendingRejectRequestId;
+    const submit = event.currentTarget.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+        await reviewAccountRequest(
+            requestId,
+            "reject",
+            document.getElementById("reject-reason").value.trim()
+        );
+        closeRejectModal();
+        showToast("Account request rejected.", "success");
+        await renderAccountRequestsScreen();
+        refreshAccountRequestBadge();
+    } catch (error) {
+        showToast(`Could not reject request: ${error.message}`, "error");
+    } finally {
+        submit.disabled = false;
+    }
 }
 
 function showSignedOutScreen() {
@@ -310,11 +503,21 @@ function showSignedOutScreen() {
     document.getElementById("nav-menu").replaceChildren();
     document.getElementById("register-form").reset();
     document.getElementById("registration-panel").hidden = true;
+    document.getElementById("registration-form-view").hidden = false;
+    document.getElementById("registration-success").hidden = true;
     document.getElementById("login-panel").hidden = false;
     document.getElementById("registration-error-msg").textContent = "";
+    document.getElementById("login-error-msg").hidden = true;
     document.getElementById("user-display-name").textContent = "Not Signed In";
     document.getElementById("user-role-label").textContent = "GUEST";
     document.getElementById("login-form").reset();
+    document.getElementById("sidebar").classList.remove("sidebar-open");
+    document.body.classList.remove("sidebar-menu-open");
+    document.getElementById("sidebar-toggle").setAttribute("aria-expanded", "false");
+    if (accountRequestRefreshTimer) {
+        window.clearInterval(accountRequestRefreshTimer);
+        accountRequestRefreshTimer = null;
+    }
     currentSelectedStudentId = null;
     currentScreen = "overview";
     destroyActiveCharts();
@@ -398,7 +601,7 @@ function setupSidebarForUser() {
             items += `
                 <li class="nav-item" data-screen="data-quality">${LABELS.nav.dataQuality}</li>
                 <li class="nav-item" data-screen="model-settings">${LABELS.nav.modelSettings}</li>
-                <li class="nav-item" data-screen="account-requests">Student Account Requests</li>
+                <li class="nav-item" data-screen="account-requests">Account Requests <span class="nav-badge" id="account-request-count" hidden>0</span></li>
             `;
         }
 
@@ -433,6 +636,7 @@ function setupSidebarForUser() {
         icon.innerHTML = navIconPaths[item.dataset.screen] || navIconPaths.inbox;
         item.prepend(icon);
         item.addEventListener("click", () => {
+            closeMobileSidebar();
             navMenu.querySelectorAll(".nav-item").forEach(el => el.classList.remove("active"));
             item.classList.add("active");
             const screen = item.dataset.screen;
@@ -442,6 +646,11 @@ function setupSidebarForUser() {
 
     if (user.role === "ADMIN" || user.role === "FACULTY") {
         refreshInboxBadge().catch(err => console.error("Could not refresh inbox count:", err));
+    }
+    if (accountRequestRefreshTimer) window.clearInterval(accountRequestRefreshTimer);
+    if (user.role === "ADMIN") {
+        refreshAccountRequestBadge();
+        accountRequestRefreshTimer = window.setInterval(refreshAccountRequestBadge, 30000);
     }
 }
 
@@ -453,6 +662,18 @@ async function refreshInboxBadge() {
 function updateInboxBadge(count) {
     const badge = document.getElementById("inbox-open-count");
     if (badge) badge.textContent = String(count);
+}
+
+async function refreshAccountRequestBadge() {
+    const badge = document.getElementById("account-request-count");
+    if (!badge || !authState.user || authState.user.role !== "ADMIN") return;
+    try {
+        const result = await getAccountRequestCount();
+        badge.textContent = String(result.count);
+        badge.hidden = result.count === 0;
+    } catch (error) {
+        console.error("Could not refresh account request count:", error);
+    }
 }
 
 function navigateToDefaultScreen() {
@@ -521,7 +742,7 @@ export function navigateToScreen(screenName, extraParam = null) {
             renderModelSettingsScreen();
             break;
         case "account-requests":
-            renderStudentAccountRequestsScreen();
+            renderAccountRequestsScreen();
             break;
         case "inbox":
             renderInboxScreen();
@@ -755,6 +976,7 @@ async function renderOverviewScreen() {
                 <div class="summary-card">
                     <div class="summary-card-header">
                         <span class="summary-label">Total Students ${helpTip("All students currently enrolled in the selected department and year.")}</span>
+                        <svg class="summary-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 11a4 4 0 0 0 0-7m1 11a7 7 0 0 1 4 6"/></svg>
                     </div>
                     <div class="summary-value mono-num" id="overview-total-students">${totalStudents}</div>
                     <div class="summary-change-row">
@@ -765,6 +987,7 @@ async function renderOverviewScreen() {
                 <div class="summary-card">
                     <div class="summary-card-header">
                         <span class="summary-label">Average ${LABELS.scoreName} ${helpTip(LABELS.scoreHelp)}</span>
+                        <svg class="summary-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5m0 14h16M7 15l4-5 3 3 5-7"/></svg>
                     </div>
                     <div class="summary-value mono-num" style="color: var(--accent-teal);"><span id="overview-average-score">${avgScore}</span> <span style="font-size: 16px; font-weight: normal; color: var(--text-muted);">${LABELS.scoreOutScores}</span></div>
                     <div class="summary-change-row">
@@ -775,6 +998,7 @@ async function renderOverviewScreen() {
                 <div class="summary-card">
                     <div class="summary-card-header">
                         <span class="summary-label">${LABELS.attentionUrgent} ${helpTip("Students who need immediate support from advisors for academics or job prep.")}</span>
+                        <svg class="summary-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 17H3l9-17Z"/><path d="M12 9v5m0 3h.01"/></svg>
                     </div>
                     <div class="summary-value mono-num" style="color: var(--status-urgent);"><span id="overview-urgent-count">${urgentCount}</span> <span id="overview-urgent-percent" style="font-size: 16px; font-weight: normal; color: var(--text-muted);">(${urgentPct})</span></div>
                     <div class="summary-change-row">
@@ -785,6 +1009,7 @@ async function renderOverviewScreen() {
                 <div class="summary-card">
                     <div class="summary-card-header">
                         <span class="summary-label">Job Readiness On Track ${helpTip("Students with strong coding, interview, and test preparation scores.")}</span>
+                        <svg class="summary-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>
                     </div>
                     <div class="summary-value mono-num" style="color: var(--status-fine);"><span id="overview-placement-count">${placementCount}</span> <span id="overview-placement-percent" style="font-size: 16px; font-weight: normal; color: var(--text-muted);">(${placementPct})</span></div>
                     <div class="summary-change-row">
@@ -2601,49 +2826,150 @@ async function renderInsightsScreen() {
 /* ==========================================================================
    SCREEN 8: UPLOAD DATA & RECORDS (DATA QUALITY - ADMIN ONLY)
    ========================================================================== */
-async function renderStudentAccountRequestsScreen() {
+async function renderAccountRequestsScreen() {
     const container = document.getElementById("screen-container");
-    try {
-        const result = await getStudentAccountRequests();
-        const requests = result.requests || [];
-        container.innerHTML = `
-            <div class="page-header">
-                <div>
-                    <h1 class="page-title">Student Account Requests</h1>
-                    <div class="page-purpose">Review student-only account requests before access is granted.</div>
-                </div>
+    const filters = renderAccountRequestsScreen.filters || {
+        status: "pending",
+        role: "",
+        search: ""
+    };
+    renderAccountRequestsScreen.filters = filters;
+    const statuses = ["pending", "approved", "rejected"];
+    container.innerHTML = `
+        <div class="page-header">
+            <div>
+                <h1 class="page-title">Account Requests</h1>
+                <div class="page-purpose">Review student and faculty access requests.</div>
             </div>
-            <div class="content-card">
-                ${requests.length ? requests.map(request => `
-                    <div class="account-request-row" data-request-id="${request.id}">
-                        <div>
-                            <strong>${escapeHtml(request.student_name)}</strong>
-                            <div class="help-text-grey">${escapeHtml(request.student_id)} · ${escapeHtml(request.department)}</div>
-                            <div class="help-text-grey">Requested ${escapeHtml(new Date(request.created_at).toLocaleString())}</div>
+        </div>
+        <section class="account-request-tools" aria-label="Account request filters">
+            <div class="account-request-tabs" role="tablist" aria-label="Request status">
+                ${statuses.map(tab => `
+                    <button type="button" class="request-tab ${filters.status === tab ? "active" : ""}"
+                            role="tab" aria-selected="${filters.status === tab}" data-status="${tab}">
+                        ${tab[0].toUpperCase()}${tab.slice(1)}
+                    </button>
+                `).join("")}
+            </div>
+            <div class="account-request-filter-row">
+                <label class="sr-only" for="request-role-filter">Filter by role</label>
+                <select id="request-role-filter" class="filter-select">
+                    <option value="" ${!filters.role ? "selected" : ""}>All roles</option>
+                    <option value="STUDENT" ${filters.role === "STUDENT" ? "selected" : ""}>Student</option>
+                    <option value="FACULTY" ${filters.role === "FACULTY" ? "selected" : ""}>Faculty</option>
+                </select>
+                <label class="sr-only" for="request-search">Search account requests</label>
+                <input id="request-search" class="filter-input" type="search" value="${escapeHtml(filters.search)}"
+                       placeholder="Search name, ID, email or department">
+            </div>
+        </section>
+        <div class="account-request-list" id="account-request-list" aria-live="polite" aria-busy="true">
+            ${Array.from({ length: 3 }, () => `
+                <article class="request-skeleton" aria-hidden="true">
+                    <span></span><span></span><span></span>
+                </article>
+            `).join("")}
+        </div>
+    `;
+
+    container.querySelectorAll(".request-tab").forEach(tab => {
+        tab.addEventListener("click", () => {
+            filters.status = tab.dataset.status;
+            renderAccountRequestsScreen();
+        });
+    });
+    container.querySelector("#request-role-filter").addEventListener("change", event => {
+        filters.role = event.target.value;
+        renderAccountRequestsScreen();
+    });
+    let searchTimer;
+    const searchInput = container.querySelector("#request-search");
+    searchInput.addEventListener("input", () => {
+        filters.search = searchInput.value.trim();
+        window.clearTimeout(searchTimer);
+        searchTimer = window.setTimeout(() => {
+            renderAccountRequestsScreen();
+            const nextSearch = document.getElementById("request-search");
+            nextSearch.focus();
+            nextSearch.setSelectionRange(nextSearch.value.length, nextSearch.value.length);
+        }, 250);
+    });
+
+    try {
+        const result = await getAccountRequests(filters);
+        const requests = result.requests || [];
+        const list = container.querySelector("#account-request-list");
+        list.setAttribute("aria-busy", "false");
+        list.innerHTML = requests.length ? requests.map(request => {
+            const personName = request.name || request.student_name || request.requested_username;
+            const identifier = request.role === "STUDENT"
+                ? request.student_id
+                : request.requested_username;
+            const displayTime = request.created_at
+                ? new Date(request.created_at).toLocaleString()
+                : "Time unavailable";
+            return `
+                <article class="account-request-card" data-request-id="${request.id}">
+                    <div class="request-card-main">
+                        <div class="request-card-heading">
+                            <h2>${escapeHtml(personName)}</h2>
+                            <span class="role-pill role-${request.role.toLowerCase()}">${request.role === "FACULTY" ? "Faculty" : "Student"}</span>
+                            <span class="request-status-pill status-${escapeHtml(request.status)}">${escapeHtml(request.status)}</span>
                         </div>
+                        <div class="request-card-details">
+                            <span><strong>${request.role === "STUDENT" ? "Student ID" : "Username"}:</strong> ${escapeHtml(identifier || "—")}</span>
+                            <span><strong>Department:</strong> ${escapeHtml(request.department || "—")}</span>
+                            <span><strong>Email:</strong> ${escapeHtml(request.email || "—")}</span>
+                            <span><strong>Requested:</strong> ${escapeHtml(displayTime)}</span>
+                            ${request.reject_reason ? `<span class="request-reason"><strong>Reason:</strong> ${escapeHtml(request.reject_reason)}</span>` : ""}
+                        </div>
+                    </div>
+                    ${request.status === "pending" ? `
                         <div class="account-request-actions">
                             <button class="btn-primary" type="button" data-decision="approve">Approve</button>
                             <button class="btn-outline" type="button" data-decision="reject">Reject</button>
                         </div>
-                    </div>
-                `).join("") : `<p class="help-text-grey">There are no pending student account requests.</p>`}
+                    ` : ""}
+                </article>
+            `;
+        }).join("") : `
+            <div class="empty-state">
+                <svg viewBox="0 0 48 48" aria-hidden="true"><path d="M14 8h20a4 4 0 0 1 4 4v24a4 4 0 0 1-4 4H14a4 4 0 0 1-4-4V12a4 4 0 0 1 4-4Z"/><path d="M18 19h12M18 25h12M18 31h7"/></svg>
+                <strong>No ${escapeHtml(filters.status)} requests found</strong>
+                <span>Try changing the role filter or search terms.</span>
             </div>
         `;
-        container.querySelectorAll(".account-request-row button").forEach(button => {
+        list.querySelectorAll(".account-request-card button").forEach(button => {
             button.addEventListener("click", async () => {
-                const row = button.closest(".account-request-row");
-                row.querySelectorAll("button").forEach(item => { item.disabled = true; });
+                const card = button.closest(".account-request-card");
+                const requestId = card.dataset.requestId;
+                if (button.dataset.decision === "reject") {
+                    openRejectModal(requestId);
+                    return;
+                }
+                card.querySelectorAll("button").forEach(item => { item.disabled = true; });
                 try {
-                    await reviewStudentAccountRequest(row.dataset.requestId, button.dataset.decision);
-                    await renderStudentAccountRequestsScreen();
+                    await reviewAccountRequest(requestId, "approve");
+                    showToast("Account request approved.", "success");
+                    await renderAccountRequestsScreen();
+                    refreshAccountRequestBadge();
                 } catch (error) {
-                    row.querySelectorAll("button").forEach(item => { item.disabled = false; });
-                    alert(`Could not ${button.dataset.decision} request: ${error.message}`);
+                    card.querySelectorAll("button").forEach(item => { item.disabled = false; });
+                    showToast(`Could not approve request: ${error.message}`, "error");
                 }
             });
         });
     } catch (error) {
-        container.innerHTML = `<div class="state-container"><p>${escapeHtml(error.message)}</p></div>`;
+        const list = container.querySelector("#account-request-list");
+        list.setAttribute("aria-busy", "false");
+        list.innerHTML = `
+            <div class="empty-state empty-state-error">
+                <strong>Could not load account requests</strong>
+                <span>${escapeHtml(error.message)}</span>
+                <button class="btn-outline" type="button">Try again</button>
+            </div>
+        `;
+        list.querySelector("button").addEventListener("click", renderAccountRequestsScreen);
     }
 }
 

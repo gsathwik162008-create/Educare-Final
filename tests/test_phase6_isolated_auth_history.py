@@ -15,8 +15,9 @@ os.environ["CORS_ALLOWED_ORIGINS"] = "http://localhost:8000"
 
 from app.auth import hash_password
 from app.database import Base, SessionLocal, engine
-from app.main import app
+from app.main import app, migrate_student_account_requests
 from app.models import (
+    AccountRequest,
     FacultyAssignment,
     InterventionAction,
     Student,
@@ -152,6 +153,174 @@ def test_admin_approval_creates_student_only_account(isolated_database):
     assert approved.json()["status"] == "approved"
     assert forbidden_directory.status_code == 403
     assert forbidden_requests.status_code == 403
+
+
+def test_faculty_request_requires_approval_and_creates_faculty_account(isolated_database):
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/api/auth/account-requests",
+            json={
+                "role": "FACULTY",
+                "name": "New Faculty",
+                "email": "new.faculty@example.edu",
+                "department": "CSE",
+                "username": "new-faculty",
+                "password": "Faculty-Secure-Password-2",
+            },
+        )
+        with SessionLocal() as db:
+            request_row = db.query(AccountRequest).filter(
+                AccountRequest.requested_username == "new-faculty"
+            ).one()
+            assert db.query(User).filter(User.username == "new-faculty").first() is None
+
+        wrong_password = client.post(
+            "/api/auth/login",
+            json={"username": "new-faculty", "password": "Incorrect-Password-1"},
+        )
+        pending_login = client.post(
+            "/api/auth/login",
+            json={"username": "new-faculty", "password": "Faculty-Secure-Password-2"},
+        )
+        admin_token = _login(client, "phase6-admin", "Admin-Secure-Password-1")
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        approved = client.post(
+            f"/api/admin/account-requests/{request_row.id}/approve",
+            headers=admin_headers,
+        )
+        faculty_login = client.post(
+            "/api/auth/login",
+            json={"username": "new-faculty", "password": "Faculty-Secure-Password-2"},
+        )
+        faculty_headers = {"Authorization": f"Bearer {faculty_login.json()['access_token']}"}
+        forbidden_list = client.get("/api/admin/account-requests", headers=faculty_headers)
+        forbidden_count = client.get("/api/admin/account-requests/count", headers=faculty_headers)
+
+    assert submitted.status_code == 202
+    assert wrong_password.status_code == 401
+    assert wrong_password.json()["detail"] == "Invalid username or password"
+    assert pending_login.status_code == 403
+    assert pending_login.json()["detail"] == "Your account is waiting for admin approval"
+    assert approved.status_code == 200
+    assert approved.json()["role"] == "FACULTY"
+    assert faculty_login.status_code == 200
+    assert faculty_login.json()["role"] == "FACULTY"
+    assert faculty_login.json()["name"] == "New Faculty"
+    assert forbidden_list.status_code == 403
+    assert forbidden_count.status_code == 403
+
+
+def test_account_request_duplicate_checks_and_rejected_login_reason(isolated_database):
+    with TestClient(app) as client:
+        payload = {
+            "role": "FACULTY",
+            "name": "Review Faculty",
+            "email": "review.faculty@example.edu",
+            "department": "ECE",
+            "username": "review-faculty",
+            "password": "Faculty-Secure-Password-3",
+        }
+        submitted = client.post("/api/auth/account-requests", json=payload)
+        duplicate_username = client.post(
+            "/api/auth/account-requests",
+            json={**payload, "email": "other@example.edu"},
+        )
+        duplicate_email = client.post(
+            "/api/auth/account-requests",
+            json={**payload, "username": "other-faculty"},
+        )
+        admin_token = _login(client, "phase6-admin", "Admin-Secure-Password-1")
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        request_id = client.get(
+            "/api/admin/account-requests?status=pending&role=FACULTY&search=Review",
+            headers=admin_headers,
+        ).json()["requests"][0]["id"]
+        rejected = client.post(
+            f"/api/admin/account-requests/{request_id}/reject",
+            headers=admin_headers,
+            json={"reason": "Please contact your department office."},
+        )
+        rejected_login = client.post(
+            "/api/auth/login",
+            json={"username": "review-faculty", "password": payload["password"]},
+        )
+        unknown_login = client.post(
+            "/api/auth/login",
+            json={"username": "review-faculty", "password": "Incorrect-Password-2"},
+        )
+        pending_count = client.get("/api/admin/account-requests/count", headers=admin_headers)
+
+    assert submitted.status_code == 202
+    assert duplicate_username.status_code == 409
+    assert duplicate_email.status_code == 409
+    assert rejected.status_code == 200
+    assert rejected_login.status_code == 403
+    assert rejected_login.json()["detail"] == (
+        "Your request was rejected: Please contact your department office."
+    )
+    assert unknown_login.status_code == 401
+    assert unknown_login.json()["detail"] == "Invalid username or password"
+    assert pending_count.json()["count"] == 0
+
+
+def test_student_and_faculty_tokens_cannot_access_admin_account_routes(isolated_database):
+    with TestClient(app) as client:
+        request_result = client.post(
+            "/api/auth/account-requests",
+            json={"role": "STUDENT", "student_id": "P6-001", "password": "Student-Secure-Password-4"},
+        )
+        admin_token = _login(client, "phase6-admin", "Admin-Secure-Password-1")
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        request_id = client.get("/api/admin/account-requests", headers=admin_headers).json()["requests"][0]["id"]
+        assert request_result.status_code == 202
+        assert client.post(
+            f"/api/admin/account-requests/{request_id}/approve",
+            headers=admin_headers,
+        ).status_code == 200
+        student_token = _login(client, "P6-001", "Student-Secure-Password-4")
+        faculty_token = _login(client, "phase6-faculty", "Faculty-Secure-Password-1")
+        student_headers = {"Authorization": f"Bearer {student_token}"}
+        faculty_headers = {"Authorization": f"Bearer {faculty_token}"}
+        student_list = client.get("/api/admin/account-requests", headers=student_headers)
+        student_count = client.get("/api/admin/account-requests/count", headers=student_headers)
+        student_approve = client.post("/api/admin/account-requests/999/approve", headers=student_headers)
+        student_reject = client.post("/api/admin/account-requests/999/reject", headers=student_headers)
+        faculty_list = client.get("/api/admin/account-requests", headers=faculty_headers)
+        faculty_count = client.get("/api/admin/account-requests/count", headers=faculty_headers)
+        faculty_approve = client.post("/api/admin/account-requests/999/approve", headers=faculty_headers)
+        faculty_reject = client.post("/api/admin/account-requests/999/reject", headers=faculty_headers)
+
+    assert [
+        student_list.status_code,
+        student_count.status_code,
+        student_approve.status_code,
+        student_reject.status_code,
+        faculty_list.status_code,
+        faculty_count.status_code,
+        faculty_approve.status_code,
+        faculty_reject.status_code,
+    ] == [403] * 8
+
+
+def test_startup_migration_copies_legacy_student_requests_once(isolated_database):
+    with SessionLocal() as db:
+        db.add(StudentAccountRequest(
+            student_id="P6-001",
+            hashed_password=hash_password("Legacy-Secure-Password-1"),
+        ))
+        db.commit()
+    migrate_student_account_requests()
+    migrate_student_account_requests()
+
+    with SessionLocal() as db:
+        migrated = db.query(AccountRequest).filter(
+            AccountRequest.legacy_request_id.isnot(None)
+        ).one()
+
+    assert migrated.role == "STUDENT"
+    assert migrated.student_id == "P6-001"
+    assert migrated.requested_username == "P6-001"
+    assert migrated.name == "History Student"
 
 
 def test_logout_revokes_access_to_protected_api(isolated_database):
