@@ -119,42 +119,62 @@ def refresh_interventions_for_all(db: Session) -> int:
     metrics_map = {m.student_id: m for m in db.query(UnifiedStudentMetrics).all()}
     scores_map = {s.student_id: s for s in db.query(StudentScore).all()}
 
-    # Existing actions map by student_id
     existing_actions = db.query(InterventionAction).all()
-    persisted_student_ids = {a.student_id for a in existing_actions if a.status in ["in_progress", "done"]}
+    actions_by_student: Dict[str, List[InterventionAction]] = {}
+    for action in existing_actions:
+        actions_by_student.setdefault(action.student_id, []).append(action)
 
     created_count = 0
     for s in students:
-        # If student already has manual actions in progress or done, keep them intact
-        if s.student_id in persisted_student_ids:
-            continue
-
         m = metrics_map.get(s.student_id)
         score = scores_map.get(s.student_id)
         if not m or not score:
             continue
 
-        # Check if pending actions already exist
-        has_pending = any(a.student_id == s.student_id and a.status == "pending" for a in existing_actions)
-        if has_pending:
-            continue
-
         recs = generate_candidate_actions(s, m, score)
+        pending_by_type = {
+            action.action_type: action
+            for action in actions_by_student.get(s.student_id, [])
+            if action.status == "pending"
+        }
         for rec in recs:
-            action = InterventionAction(
-                student_id=s.student_id,
-                mentor_id=s.mentor_id,
-                action_type=rec["action_type"],
-                description=rec["description"],
-                potential_gain=rec["potential_gain"],
-                urgency=rec["urgency"],
-                priority=rec["priority"],
-                status="pending",
-                notes="",
-                score_at_creation=float(score.total_success_score)
-            )
-            db.add(action)
-            created_count += 1
+            action = pending_by_type.pop(rec["action_type"], None)
+            if action is None:
+                action = InterventionAction(
+                    student_id=s.student_id,
+                    mentor_id=s.mentor_id,
+                    action_type=rec["action_type"],
+                    description=rec["description"],
+                    potential_gain=rec["potential_gain"],
+                    urgency=rec["urgency"],
+                    priority=rec["priority"],
+                    status="pending",
+                    notes="",
+                    score_at_creation=float(score.total_success_score)
+                )
+                db.add(action)
+                created_count += 1
+                continue
 
-    db.commit()
+            action.mentor_id = s.mentor_id
+            action.description = rec["description"]
+            action.potential_gain = rec["potential_gain"]
+            action.urgency = rec["urgency"]
+            action.priority = rec["priority"]
+            action.updated_at = datetime.now()
+
+        for obsolete_action in pending_by_type.values():
+            if (obsolete_action.notes or "").strip():
+                obsolete_action.description = (
+                    "This action is no longer among the current top recommendations. "
+                    "Review the advisor notes before closing it."
+                )
+                obsolete_action.potential_gain = 0.0
+                obsolete_action.urgency = 0.0
+                obsolete_action.priority = 0.0
+                obsolete_action.updated_at = datetime.now()
+            else:
+                db.delete(obsolete_action)
+
+    db.flush()
     return created_count

@@ -1,19 +1,12 @@
-import io
+import re
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, List, Tuple
+
 import pandas as pd
-import numpy as np
 from sqlalchemy.orm import Session
 
-from app.models import (
-    Student,
-    UnifiedStudentMetrics,
-    SemesterHistory,
-    SubjectRecord,
-    CleaningLog
-)
+from app.models import CleaningLog, Student, UnifiedStudentMetrics
 
-# Canonical Department Mappings
 DEPT_MAPPING = {
     "cse": "CSE",
     "c.s.e": "CSE",
@@ -42,7 +35,12 @@ DEPT_MAPPING = {
     "c.e.": "Civil",
 }
 
-# Required columns for each source file
+
+def normalize_department(value: str) -> str:
+    cleaned = value.strip()
+    return DEPT_MAPPING.get(cleaned.casefold(), cleaned)
+
+
 SOURCE_REQUIRED_COLUMNS = {
     "academic": ["student_id", "name", "department", "year", "semester", "cgpa", "backlogs"],
     "attendance": ["student_id", "attendance_pct"],
@@ -50,10 +48,21 @@ SOURCE_REQUIRED_COLUMNS = {
     "engagement": ["student_id", "event_participation_count", "library_visits"],
     "placement": ["student_id", "aptitude_score", "coding_score", "mock_interviews_completed"],
     "skills": ["student_id", "technical_skills_score", "soft_skills_score"],
-    "feedback": ["student_id", "faculty_feedback_score", "peer_feedback_score"]
+    "feedback": ["student_id", "faculty_feedback_score", "peer_feedback_score"],
 }
 
-# Sample Templates Definitions
+SOURCE_ALLOWED_COLUMNS = {
+    "academic": set(SOURCE_REQUIRED_COLUMNS["academic"]),
+    "attendance": set(SOURCE_REQUIRED_COLUMNS["attendance"]) | {
+        "lab_attendance_pct", "lecture_attendance_pct",
+    },
+    "lms": set(SOURCE_REQUIRED_COLUMNS["lms"]) | {"forum_posts_count"},
+    "engagement": set(SOURCE_REQUIRED_COLUMNS["engagement"]) | {"hackathons_attended"},
+    "placement": set(SOURCE_REQUIRED_COLUMNS["placement"]) | {"resume_score"},
+    "skills": set(SOURCE_REQUIRED_COLUMNS["skills"]) | {"certifications_count"},
+    "feedback": set(SOURCE_REQUIRED_COLUMNS["feedback"]) | {"mentor_feedback_score"},
+}
+
 CSV_TEMPLATES = {
     "academic": "student_id,name,department,year,semester,cgpa,backlogs\n22CSE001,Aarav Sharma,CSE,3,5,8.45,0\n22ECE012,Diya Patel,ECE,3,5,7.20,1\n",
     "attendance": "student_id,attendance_pct,lab_attendance_pct,lecture_attendance_pct\n22CSE001,88.5,92.0,86.0\n22ECE012,71.2,75.0,68.5\n",
@@ -61,357 +70,387 @@ CSV_TEMPLATES = {
     "engagement": "student_id,event_participation_count,library_visits,hackathons_attended\n22CSE001,4,18,2\n22ECE012,1,6,0\n",
     "placement": "student_id,aptitude_score,coding_score,mock_interviews_completed,resume_score\n22CSE001,78.5,82.0,2,85.0\n22ECE012,55.0,38.0,0,60.0\n",
     "skills": "student_id,technical_skills_score,soft_skills_score,certifications_count\n22CSE001,84.0,80.0,3\n22ECE012,62.0,65.0,1\n",
-    "feedback": "student_id,faculty_feedback_score,peer_feedback_score,mentor_feedback_score\n22CSE001,86.0,82.0,85.0\n22ECE012,65.0,70.0,68.0\n"
+    "feedback": "student_id,faculty_feedback_score,peer_feedback_score,mentor_feedback_score\n22CSE001,86.0,82.0,85.0\n22ECE012,65.0,70.0,68.0\n",
 }
 
+NUMERIC_RULES: Dict[str, Tuple[float, float, bool]] = {
+    "year": (1, 4, True),
+    "semester": (1, 8, True),
+    "cgpa": (0, 10, False),
+    "backlogs": (0, 20, True),
+    "attendance_pct": (0, 100, False),
+    "lab_attendance_pct": (0, 100, False),
+    "lecture_attendance_pct": (0, 100, False),
+    "lms_login_count": (0, 1000, True),
+    "lms_time_spent_hrs": (0, 500, False),
+    "assignments_submitted_pct": (0, 100, False),
+    "forum_posts_count": (0, 200, True),
+    "event_participation_count": (0, 50, True),
+    "library_visits": (0, 200, True),
+    "hackathons_attended": (0, 50, True),
+    "aptitude_score": (0, 100, False),
+    "coding_score": (0, 100, False),
+    "mock_interviews_completed": (0, 20, True),
+    "resume_score": (0, 100, False),
+    "technical_skills_score": (0, 100, False),
+    "soft_skills_score": (0, 100, False),
+    "certifications_count": (0, 100, True),
+    "faculty_feedback_score": (0, 100, False),
+    "peer_feedback_score": (0, 100, False),
+    "mentor_feedback_score": (0, 100, False),
+}
 
-def clean_student_id(val: Any) -> str:
-    """Normalize student ID string."""
-    if pd.isna(val) or val is None:
+METRIC_FIELDS = {
+    "cgpa": "cgpa",
+    "backlogs": "total_backlogs",
+    "attendance_pct": "attendance_pct",
+    "lms_login_count": "lms_login_count",
+    "lms_time_spent_hrs": "lms_time_spent_hrs",
+    "assignments_submitted_pct": "assignments_submitted_pct",
+    "forum_posts_count": "forum_posts_count",
+    "event_participation_count": "event_participation_count",
+    "library_visits": "library_visits",
+    "aptitude_score": "aptitude_score",
+    "coding_score": "coding_score",
+    "mock_interviews_completed": "mock_interviews_completed",
+    "technical_skills_score": "technical_skills_score",
+    "soft_skills_score": "soft_skills_score",
+    "faculty_feedback_score": "faculty_feedback_score",
+    "peer_feedback_score": "peer_feedback_score",
+}
+
+STUDENT_ID_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9_-]{1,49}$")
+
+
+def clean_student_id(value: Any) -> str:
+    if value is None or pd.isna(value):
         return ""
-    return str(val).strip().upper()
-
-
-def clean_department(val: Any) -> Tuple[str, bool]:
-    """Normalize department string to canonical name."""
-    if pd.isna(val) or val is None:
-        return "CSE", True
-    raw = str(val).strip().lower()
-    canonical = DEPT_MAPPING.get(raw, "CSE")
-    was_modified = canonical != str(val).strip()
-    return canonical, was_modified
+    return str(value).strip().upper()
 
 
 def validate_source_columns(source_name: str, df: pd.DataFrame) -> List[str]:
-    """Validate that required columns are present in DataFrame."""
     required = SOURCE_REQUIRED_COLUMNS.get(source_name, ["student_id"])
-    missing = [c for c in required if c not in df.columns]
-    return missing
+    columns = [str(column).strip().lower() for column in df.columns]
+    return [column for column in required if column not in columns]
 
 
-def clean_and_log_dataframe(
-    source_name: str,
-    df: pd.DataFrame,
-    db: Session,
-    dept_ref_map: Dict[str, str] = None
-) -> Tuple[pd.DataFrame, List[CleaningLog]]:
-    """
-    Cleans a single source dataframe according to documented rules:
-    - Normalizes student IDs
-    - Standardizes department names
-    - Handles duplicates (deduplicates on student_id)
-    - Clips out-of-range values
-    - Imputes missing values by department/cohort medians
-    - Logs every intervention in cleaning_log
-    """
+def _cleaning_log(
+    source: str,
+    row_number: int,
+    student_id: str,
+    field: str,
+    issue: str,
+    original: Any,
+    cleaned: Any,
+    rule: str,
+) -> CleaningLog:
+    return CleaningLog(
+        source_file=source,
+        row_number=row_number,
+        student_id=student_id or None,
+        field_name=field,
+        issue_type=issue,
+        original_value=str(original)[:255],
+        cleaned_value=str(cleaned)[:255],
+        rule_applied=rule,
+    )
+
+
+def _prepare_sources(
+    sources_data: Dict[str, pd.DataFrame],
+    import_mode: str,
+) -> Tuple[Dict[str, List[Tuple[str, Dict[str, Any]]]], List[CleaningLog], Dict[str, List[str]], Dict[str, int]]:
+    errors: Dict[str, List[str]] = {}
     logs: List[CleaningLog] = []
-    df = df.copy()
+    prepared: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+    counts = {"accepted_rows": 0, "rejected_rows": 0, "duplicate_rows": 0}
 
-    # 1. Clean student_id
-    orig_sids = df["student_id"].copy() if "student_id" in df.columns else []
-    df["student_id"] = df["student_id"].apply(clean_student_id)
-    for idx, (orig, cleaned) in enumerate(zip(orig_sids, df["student_id"])):
-        if str(orig).strip() != cleaned:
-            logs.append(CleaningLog(
-                source_file=source_name,
-                row_number=idx + 1,
-                student_id=cleaned,
-                field_name="student_id",
-                issue_type="id_normalization",
-                original_value=str(orig),
-                cleaned_value=cleaned,
-                rule_applied="Trim whitespace and uppercase student ID"
-            ))
+    unknown_sources = sorted(set(sources_data) - set(SOURCE_REQUIRED_COLUMNS))
+    if unknown_sources:
+        errors["sources"] = [f"Unknown source name(s): {', '.join(unknown_sources)}."]
+    if not sources_data:
+        errors["sources"] = ["Upload at least one CSV file."]
+    if import_mode == "full":
+        missing_sources = sorted(set(SOURCE_REQUIRED_COLUMNS) - set(sources_data))
+        if missing_sources:
+            errors["sources"] = [
+                f"Full imports require all seven source files; missing: {', '.join(missing_sources)}."
+            ]
 
-    # Drop empty student_ids if any
-    df = df[df["student_id"] != ""].copy()
+    for source, dataframe in sources_data.items():
+        if source not in SOURCE_REQUIRED_COLUMNS:
+            continue
+        source_errors: List[str] = []
+        df = dataframe.copy()
+        normalized_columns = [str(column).strip().lower() for column in df.columns]
+        if len(set(normalized_columns)) != len(normalized_columns):
+            errors[source] = ["Column names must be unique after trimming and case normalization."]
+            counts["rejected_rows"] += len(df)
+            continue
+        df.columns = normalized_columns
+        missing_columns = validate_source_columns(source, df)
+        if missing_columns:
+            errors[source] = [f"Missing required columns: {', '.join(missing_columns)}."]
+            counts["rejected_rows"] += len(df)
+            continue
+        unexpected_columns = sorted(set(normalized_columns) - SOURCE_ALLOWED_COLUMNS[source])
+        if unexpected_columns:
+            errors[source] = [
+                f"Unsupported column(s): {', '.join(unexpected_columns)}."
+            ]
+            counts["rejected_rows"] += len(df)
+            continue
+        if df.empty:
+            errors[source] = ["CSV must contain at least one data row."]
+            continue
 
-    # 2. Check for duplicate IDs
-    dup_mask = df.duplicated(subset=["student_id"], keep=False)
-    if dup_mask.any():
-        for idx, row in df[dup_mask].iterrows():
-            logs.append(CleaningLog(
-                source_file=source_name,
-                row_number=int(idx) + 1,
-                student_id=str(row["student_id"]),
-                field_name="student_id",
-                issue_type="duplicate_id",
-                original_value=str(row["student_id"]),
-                cleaned_value=str(row["student_id"]),
-                rule_applied="Deduplicate student records; retained latest entry"
-            ))
-        # Keep last record for duplicates
-        df = df.drop_duplicates(subset=["student_id"], keep="last").copy()
+        unique_rows: Dict[str, Dict[str, Any]] = {}
+        for index, row in df.iterrows():
+            row_number = int(index) + 2 if isinstance(index, int) else len(unique_rows) + 2
+            original_id = row.get("student_id")
+            student_id = clean_student_id(original_id)
+            if not student_id or not STUDENT_ID_PATTERN.fullmatch(student_id):
+                source_errors.append(f"Row {row_number}: student_id is missing or invalid.")
+                counts["rejected_rows"] += 1
+                continue
 
-    # 3. Clean department if present
-    if "department" in df.columns:
-        for idx, val in df["department"].items():
-            cleaned, changed = clean_department(val)
-            if changed:
-                logs.append(CleaningLog(
-                    source_file=source_name,
-                    row_number=int(idx) + 1,
-                    student_id=str(df.loc[idx, "student_id"]),
-                    field_name="department",
-                    issue_type="spelling_normalization",
-                    original_value=str(val),
-                    cleaned_value=cleaned,
-                    rule_applied=f"Mapped '{val}' to standardized department code '{cleaned}'"
+            values: Dict[str, Any] = {"student_id": student_id}
+            row_invalid = False
+            if str(original_id).strip() != student_id:
+                logs.append(_cleaning_log(
+                    source, row_number, student_id, "student_id", "id_normalization",
+                    original_id, student_id, "Trim whitespace and uppercase student ID.",
                 ))
-            df.loc[idx, "department"] = cleaned
 
-    # Range definitions: (min_val, max_val, scale_divisor_if_over_10)
-    range_rules = {
-        "cgpa": (0.0, 10.0),
-        "backlogs": (0, 20),
-        "attendance_pct": (0.0, 100.0),
-        "lms_login_count": (0, 1000),
-        "lms_time_spent_hrs": (0.0, 500.0),
-        "assignments_submitted_pct": (0.0, 100.0),
-        "forum_posts_count": (0, 200),
-        "event_participation_count": (0, 50),
-        "library_visits": (0, 200),
-        "aptitude_score": (0.0, 100.0),
-        "coding_score": (0.0, 100.0),
-        "mock_interviews_completed": (0, 20),
-        "technical_skills_score": (0.0, 100.0),
-        "soft_skills_score": (0.0, 100.0),
-        "faculty_feedback_score": (0.0, 100.0),
-        "peer_feedback_score": (0.0, 100.0),
-    }
+            for column in normalized_columns:
+                if column == "student_id" or column not in (
+                    set(NUMERIC_RULES) | {"name", "department"}
+                ):
+                    continue
+                raw_value = row[column]
+                if raw_value is None or pd.isna(raw_value) or str(raw_value).strip() == "":
+                    if import_mode == "full":
+                        source_errors.append(f"Row {row_number}: {column} is required and cannot be blank.")
+                        row_invalid = True
+                    else:
+                        logs.append(_cleaning_log(
+                            source, row_number, student_id, column, "missing_value",
+                            raw_value, "", "Blank partial-update values leave existing data unchanged.",
+                        ))
+                    continue
 
-    # 4. Clip out-of-range & handle missing values
-    for col, (min_v, max_v) in range_rules.items():
-        if col in df.columns:
-            # Handle out of range
-            for idx, val in df[col].items():
-                if pd.notna(val):
-                    try:
-                        num = float(val)
-                        cleaned_num = num
-                        # Special handling for CGPA entered on 100 scale (e.g. 85.0 instead of 8.5)
-                        if col == "cgpa" and num > 10.0 and num <= 100.0:
-                            cleaned_num = round(num / 10.0, 2)
-                            logs.append(CleaningLog(
-                                source_file=source_name,
-                                row_number=int(idx) + 1,
-                                student_id=str(df.loc[idx, "student_id"]),
-                                field_name=col,
-                                issue_type="out_of_range",
-                                original_value=str(val),
-                                cleaned_value=str(cleaned_num),
-                                rule_applied="Rescaled 100-point CGPA to 10.0 scale"
-                            ))
-                        elif num < min_v or num > max_v:
-                            cleaned_num = min(max(num, min_v), max_v)
-                            logs.append(CleaningLog(
-                                source_file=source_name,
-                                row_number=int(idx) + 1,
-                                student_id=str(df.loc[idx, "student_id"]),
-                                field_name=col,
-                                issue_type="out_of_range",
-                                original_value=str(val),
-                                cleaned_value=str(cleaned_num),
-                                rule_applied=f"Clipped {col} from [{min_v}, {max_v}]"
-                            ))
-                        df.loc[idx, col] = cleaned_num
-                    except (ValueError, TypeError):
-                        pass
+                if column == "department":
+                    raw_department = str(raw_value).strip()
+                    department = DEPT_MAPPING.get(raw_department.lower())
+                    if department is None:
+                        source_errors.append(
+                            f"Row {row_number}: department '{raw_department}' is not recognized."
+                        )
+                        row_invalid = True
+                        continue
+                    values[column] = department
+                    if raw_department != department:
+                        logs.append(_cleaning_log(
+                            source, row_number, student_id, column, "spelling_normalization",
+                            raw_department, department, "Map recognized department aliases to canonical names.",
+                        ))
+                    continue
 
-            # Handle missing values
-            missing_mask = df[col].isna()
-            if missing_mask.any():
-                col_median = float(df[col].dropna().median()) if not df[col].dropna().empty else 50.0
-                if col == "cgpa":
-                    col_median = 7.0
-                elif col == "backlogs":
-                    col_median = 0.0
+                if column == "name":
+                    name = str(raw_value).strip()
+                    if not name or len(name) > 100:
+                        source_errors.append(f"Row {row_number}: name must contain 1 to 100 characters.")
+                        row_invalid = True
+                    else:
+                        values[column] = name
+                    continue
 
-                for idx in df[missing_mask].index:
-                    df.loc[idx, col] = col_median
-                    logs.append(CleaningLog(
-                        source_file=source_name,
-                        row_number=int(idx) + 1,
-                        student_id=str(df.loc[idx, "student_id"]),
-                        field_name=col,
-                        issue_type="missing_value",
-                        original_value="NaN",
-                        cleaned_value=str(col_median),
-                        rule_applied=f"Imputed missing {col} with cohort median ({col_median:.1f})"
+                minimum, maximum, integer_value = NUMERIC_RULES[column]
+                try:
+                    numeric_value = float(str(raw_value).strip())
+                except (TypeError, ValueError):
+                    source_errors.append(f"Row {row_number}: {column} must be numeric.")
+                    row_invalid = True
+                    continue
+                if not pd.notna(numeric_value):
+                    source_errors.append(f"Row {row_number}: {column} must be a finite number.")
+                    row_invalid = True
+                    continue
+                if column == "cgpa" and 10 < numeric_value <= 100:
+                    logs.append(_cleaning_log(
+                        source, row_number, student_id, column, "out_of_range",
+                        raw_value, round(numeric_value / 10, 2),
+                        "Convert a CGPA expressed on the 100-point scale to a 10-point scale.",
                     ))
+                    numeric_value = round(numeric_value / 10, 2)
+                if numeric_value < minimum or numeric_value > maximum:
+                    source_errors.append(
+                        f"Row {row_number}: {column} must be between {minimum:g} and {maximum:g}."
+                    )
+                    row_invalid = True
+                    continue
+                if integer_value and not numeric_value.is_integer():
+                    source_errors.append(f"Row {row_number}: {column} must be a whole number.")
+                    row_invalid = True
+                    continue
+                values[column] = int(numeric_value) if integer_value else numeric_value
 
-    return df, logs
+            if row_invalid:
+                counts["rejected_rows"] += 1
+                continue
+
+            previous = unique_rows.get(student_id)
+            if previous is not None:
+                if previous == values:
+                    counts["duplicate_rows"] += 1
+                    logs.append(_cleaning_log(
+                        source, row_number, student_id, "student_id", "duplicate_id",
+                        student_id, student_id, "Ignore an exact duplicate student row.",
+                    ))
+                else:
+                    source_errors.append(
+                        f"Row {row_number}: conflicting duplicate record for student_id {student_id}."
+                    )
+                    counts["rejected_rows"] += 1
+                continue
+            unique_rows[student_id] = values
+
+        if source_errors:
+            errors[source] = source_errors
+        prepared[source] = list(unique_rows.items())
+
+    counts["accepted_rows"] = sum(len(rows) for rows in prepared.values())
+    return prepared, logs, errors, counts
 
 
 def ingest_seven_sources(
     sources_data: Dict[str, pd.DataFrame],
-    db: Session
+    db: Session,
+    import_mode: str = "partial",
 ) -> Dict[str, Any]:
-    """
-    Ingest, clean, merge, and persist all 7 sources into unified student records.
-    Returns status summary with row counts and logs generated.
-    """
-    all_logs: List[CleaningLog] = []
-    cleaned_dfs: Dict[str, pd.DataFrame] = {}
-    validation_errors = {}
-
-    # 1. Validate each file
-    for src_name, req_cols in SOURCE_REQUIRED_COLUMNS.items():
-        if src_name in sources_data:
-            missing = validate_source_columns(src_name, sources_data[src_name])
-            if missing:
-                validation_errors[src_name] = f"Missing required columns: {', '.join(missing)}"
-
-    if validation_errors:
+    """Validate all source data, then apply an atomic upsert without committing the caller's transaction."""
+    if import_mode not in {"partial", "full"}:
         return {
             "status": "error",
-            "message": "Validation errors found in uploaded files",
-            "errors": validation_errors
+            "message": "import_mode must be 'partial' or 'full'.",
+            "errors": {"import_mode": ["Choose 'partial' or 'full'."]},
+            "accepted_rows": 0,
+            "rejected_rows": 0,
+            "duplicate_rows": 0,
+            "updated_rows": 0,
         }
 
-    # 2. Clean each dataframe
-    for src_name, df in sources_data.items():
-        cleaned_df, logs = clean_and_log_dataframe(src_name, df, db)
-        cleaned_dfs[src_name] = cleaned_df
-        all_logs.extend(logs)
+    prepared, logs, errors, counts = _prepare_sources(sources_data, import_mode)
+    existing_students = {
+        student.student_id: student for student in db.query(Student).all()
+    }
+    incoming_ids = {
+        source: {student_id for student_id, _ in rows}
+        for source, rows in prepared.items()
+    }
 
-    # 3. Academic data forms the primary student foundation
-    academic_df = cleaned_dfs.get("academic")
-    if academic_df is None or academic_df.empty:
+    if import_mode == "partial":
+        unknown_ids = sorted({
+            student_id
+            for ids in incoming_ids.values()
+            for student_id in ids
+            if student_id not in existing_students
+        })
+        if unknown_ids:
+            errors["student_id"] = [
+                f"Partial imports can update existing students only; {len(unknown_ids)} unknown student ID(s) found."
+            ]
+    elif incoming_ids:
+        academic_ids = incoming_ids.get("academic", set())
+        for source, ids in incoming_ids.items():
+            if ids != academic_ids:
+                errors[source] = [
+                    "Full-import student IDs must match the academic file exactly."
+                ]
+
+    if errors:
+        counts["rejected_rows"] += counts["accepted_rows"]
+        counts["accepted_rows"] = 0
         return {
             "status": "error",
-            "message": "Academic dataset is required to establish student identity"
+            "message": "CSV validation failed; no records were changed.",
+            "errors": errors,
+            **counts,
+            "updated_rows": 0,
         }
 
-    # Upsert Students
-    existing_students = {s.student_id: s for s in db.query(Student).all()}
+    persisted_columns = {"student_id", "name", "department", "year", "semester"} | set(METRIC_FIELDS)
+    not_persisted_columns = sorted({
+        str(column).strip().lower()
+        for dataframe in sources_data.values()
+        for column in dataframe.columns
+        if str(column).strip().lower() not in persisted_columns
+    })
 
-    for _, row in academic_df.iterrows():
-        sid = str(row["student_id"])
-        name = str(row.get("name", f"Student {sid}"))
-        dept = str(row.get("department", "CSE"))
-        year = int(row.get("year", 3))
-        sem = int(row.get("semester", 5))
-        email = f"{sid.lower()}@campus.edu"
+    source_order = ["academic", "attendance", "lms", "engagement", "placement", "skills", "feedback"]
+    updated_rows = 0
+    metrics_by_id = {
+        metric.student_id: metric for metric in db.query(UnifiedStudentMetrics).all()
+    }
 
-        if sid in existing_students:
-            s = existing_students[sid]
-            s.name = name
-            s.department = dept
-            s.year = year
-            s.semester = sem
-        else:
-            s = Student(
-                student_id=sid,
-                name=name,
-                department=dept,
-                year=year,
-                semester=sem,
-                email=email
-            )
-            db.add(s)
-            existing_students[sid] = s
+    try:
+        for source in source_order:
+            for student_id, values in prepared.get(source, []):
+                student = existing_students.get(student_id)
+                if student is None:
+                    student = Student(
+                        student_id=student_id,
+                        name=values["name"],
+                        department=values["department"],
+                        year=values["year"],
+                        semester=values["semester"],
+                    )
+                    db.add(student)
+                    existing_students[student_id] = student
+                    row_changed = True
+                else:
+                    row_changed = False
+                    for field in ("name", "department", "year", "semester"):
+                        if field in values and getattr(student, field) != values[field]:
+                            setattr(student, field, values[field])
+                            row_changed = True
 
-    db.flush()
+                metric_fields = {
+                    field: METRIC_FIELDS[field]
+                    for field in values
+                    if field in METRIC_FIELDS
+                }
+                if metric_fields:
+                    metric = metrics_by_id.get(student_id)
+                    if metric is None:
+                        metric = UnifiedStudentMetrics(student_id=student_id)
+                        db.add(metric)
+                        metrics_by_id[student_id] = metric
+                    metric_changed = False
+                    for field, model_field in metric_fields.items():
+                        if getattr(metric, model_field) != values[field]:
+                            setattr(metric, model_field, values[field])
+                            row_changed = True
+                            metric_changed = True
+                    if metric_changed:
+                        metric.last_updated = datetime.now(timezone.utc)
 
-    # 4. Merge all 7 sources into UnifiedStudentMetrics
-    merged_df = academic_df[["student_id", "cgpa", "backlogs"]].copy()
+                if row_changed:
+                    updated_rows += 1
 
-    # Join other sources
-    for src_key in ["attendance", "lms", "engagement", "placement", "skills", "feedback"]:
-        if src_key in cleaned_dfs:
-            src_df = cleaned_dfs[src_key]
-            cols_to_use = [c for c in src_df.columns if c == "student_id" or c in UnifiedStudentMetrics.__table__.columns.keys()]
-            merged_df = pd.merge(merged_df, src_df[cols_to_use], on="student_id", how="left")
-
-    existing_metrics = {m.student_id: m for m in db.query(UnifiedStudentMetrics).all()}
-
-    for _, row in merged_df.iterrows():
-        sid = str(row["student_id"])
-        m = existing_metrics.get(sid)
-        if not m:
-            m = UnifiedStudentMetrics(student_id=sid)
-            db.add(m)
-            existing_metrics[sid] = m
-
-        m.cgpa = float(row.get("cgpa", 7.0))
-        m.total_backlogs = int(row.get("backlogs", 0))
-        m.attendance_pct = float(row.get("attendance_pct", 75.0))
-        m.lms_login_count = int(row.get("lms_login_count", 50))
-        m.lms_time_spent_hrs = float(row.get("lms_time_spent_hrs", 30.0))
-        m.assignments_submitted_pct = float(row.get("assignments_submitted_pct", 80.0))
-        m.forum_posts_count = int(row.get("forum_posts_count", 5))
-        m.event_participation_count = int(row.get("event_participation_count", 2))
-        m.library_visits = int(row.get("library_visits", 10))
-        m.aptitude_score = float(row.get("aptitude_score", 60.0))
-        m.coding_score = float(row.get("coding_score", 50.0))
-        m.mock_interviews_completed = int(row.get("mock_interviews_completed", 1))
-        m.technical_skills_score = float(row.get("technical_skills_score", 65.0))
-        m.soft_skills_score = float(row.get("soft_skills_score", 70.0))
-        m.faculty_feedback_score = float(row.get("faculty_feedback_score", 75.0))
-        m.peer_feedback_score = float(row.get("peer_feedback_score", 75.0))
-        m.last_updated = datetime.now(timezone.utc)
-
-    # 5. Populate Semester History and Subject Records for rich analytics
-    for sid, s in existing_students.items():
-        curr_sem = s.semester
-        m = existing_metrics.get(sid)
-        base_gpa = m.cgpa if m else 7.0
-        base_att = m.attendance_pct if m else 80.0
-
-        # Check existing semester history
-        existing_sems = db.query(SemesterHistory).filter(SemesterHistory.student_id == sid).count()
-        if existing_sems == 0:
-            for sem_idx in range(1, curr_sem + 1):
-                # Realistic trend around CGPA
-                sem_gpa = round(min(max(base_gpa + ((sem_idx - curr_sem) * 0.1) + np.random.uniform(-0.3, 0.3), 3.5), 9.9), 2)
-                sem_att = round(min(max(base_att + np.random.uniform(-4, 4), 45.0), 99.0), 1)
-                db.add(SemesterHistory(
-                    student_id=sid,
-                    semester=sem_idx,
-                    gpa=sem_gpa,
-                    attendance_pct=sem_att,
-                    credits_earned=22,
-                    backlogs=1 if sem_gpa < 5.0 else 0
-                ))
-
-        # Check existing subject records for current semester
-        existing_subjects = db.query(SubjectRecord).filter(
-            SubjectRecord.student_id == sid,
-            SubjectRecord.semester == curr_sem
-        ).count()
-        if existing_subjects == 0:
-            dept_subjects = {
-                "CSE": [("CS501", "Design and Analysis of Algorithms"), ("CS502", "Database Management Systems"), ("CS503", "Operating Systems"), ("CS504", "Computer Networks"), ("CS505", "Web Technologies")],
-                "ECE": [("EC501", "Digital Signal Processing"), ("EC502", "Microprocessors & Microcontrollers"), ("EC503", "Electromagnetic Fields"), ("EC504", "Analog Communication"), ("EC505", "VLSI Design")],
-                "EEE": [("EE501", "Power Electronics"), ("EE502", "Control Systems"), ("EE503", "Electrical Machines"), ("EE504", "Power Systems"), ("EE505", "Transmission & Distribution")],
-                "Mech": [("ME501", "Thermodynamics"), ("ME502", "Fluid Mechanics"), ("ME503", "Kinematics of Machinery"), ("ME504", "Manufacturing Technology"), ("ME505", "Machine Design")],
-                "Civil": [("CE501", "Structural Analysis"), ("CE502", "Geotechnical Engineering"), ("CE503", "Surveying & Geomatics"), ("CE504", "Concrete Technology"), ("CE505", "Hydraulics Engineering")]
-            }.get(s.department, [("GE501", "Core Subject 1"), ("GE502", "Core Subject 2"), ("GE503", "Core Subject 3"), ("GE504", "Core Subject 4"), ("GE505", "Core Subject 5")])
-
-            for code, name in dept_subjects:
-                subj_marks = round(min(max(base_gpa * 9.5 + np.random.uniform(-8, 8), 25.0), 98.0), 1)
-                subj_att = round(min(max(base_att + np.random.uniform(-6, 6), 40.0), 100.0), 1)
-                db.add(SubjectRecord(
-                    student_id=sid,
-                    semester=curr_sem,
-                    subject_code=code,
-                    subject_name=name,
-                    marks=subj_marks,
-                    max_marks=100.0,
-                    attendance_pct=subj_att,
-                    is_backlog=subj_marks < 40.0
-                ))
-
-    # 6. Save cleaning logs
-    for log in all_logs:
-        db.add(log)
-
-    db.commit()
+        db.add_all(logs)
+        db.flush()
+    except Exception:
+        db.rollback()
+        raise
 
     return {
         "status": "success",
+        "import_mode": import_mode,
         "students_count": len(existing_students),
-        "cleaning_logs_count": len(all_logs),
-        "sources_merged": list(cleaned_dfs.keys())
+        "cleaning_logs_count": len(logs),
+        "sources_merged": list(prepared),
+        "not_persisted_columns": not_persisted_columns,
+        **counts,
+        "updated_rows": updated_rows,
     }

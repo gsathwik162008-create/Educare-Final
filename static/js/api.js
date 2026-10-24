@@ -4,10 +4,47 @@
 
 const API_BASE = "";
 
+function formatApiError(errData, fallback) {
+    const detail = errData?.detail;
+    if (typeof detail === "string") {
+        return detail;
+    }
+    if (detail && typeof detail === "object") {
+        const messages = [detail.message];
+        if (detail.errors && typeof detail.errors === "object") {
+            Object.values(detail.errors).forEach(value => {
+                messages.push(...(Array.isArray(value) ? value : [value]));
+            });
+        }
+        if (detail.counts && typeof detail.counts === "object") {
+            const counts = detail.counts;
+            messages.push(
+                `Accepted: ${counts.accepted_rows || 0}; rejected: ${counts.rejected_rows || 0}; ` +
+                `duplicates: ${counts.duplicate_rows || 0}; updated: ${counts.updated_rows || 0}.`
+            );
+        }
+        const message = messages.filter(value => typeof value === "string" && value).join(" ");
+        if (message) {
+            return message;
+        }
+    }
+    return fallback;
+}
+
+function readStoredUser() {
+    try {
+        return JSON.parse(localStorage.getItem("user") || "null");
+    } catch {
+        localStorage.removeItem("user");
+        return null;
+    }
+}
+
 export const authState = {
     token: localStorage.getItem("token") || null,
-    user: JSON.parse(localStorage.getItem("user") || "null")
+    user: readStoredUser()
 };
+const activeRequests = new Set();
 
 export async function apiRequest(endpoint, options = {}) {
     const headers = options.headers || {};
@@ -20,28 +57,30 @@ export async function apiRequest(endpoint, options = {}) {
         headers["Content-Type"] = "application/json";
     }
 
+    const requestController = new AbortController();
     const config = {
         ...options,
-        headers
+        headers,
+        signal: options.signal || requestController.signal
     };
+    if (!options.signal) activeRequests.add(requestController);
 
     try {
         const response = await fetch(`${API_BASE}${endpoint}`, config);
         
-        if (response.status === 401) {
-            logout();
-            window.location.reload();
-            throw new Error("Session expired. Please log in again.");
+        if (response.status === 401 && endpoint !== "/api/auth/login") {
+            logout({ revoke: false });
+            throw new Error("Session expired. Please sign in again.");
         }
 
         if (response.status === 403) {
             const errData = await response.json().catch(() => ({}));
-            throw new Error(errData.detail || "Access forbidden for your user role.");
+            throw new Error(formatApiError(errData, "Access forbidden for your user role."));
         }
 
         if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
-            throw new Error(errData.detail || `Request failed with status ${response.status}`);
+            throw new Error(formatApiError(errData, `Request failed with status ${response.status}`));
         }
 
         const contentType = response.headers.get("content-type");
@@ -52,6 +91,8 @@ export async function apiRequest(endpoint, options = {}) {
     } catch (err) {
         console.error(`API Error on [${endpoint}]:`, err);
         throw err;
+    } finally {
+        activeRequests.delete(requestController);
     }
 }
 
@@ -74,11 +115,33 @@ export async function login(username, password) {
     return authState.user;
 }
 
-export function logout() {
+export function getCurrentUser() {
+    return apiRequest("/api/auth/me");
+}
+
+export function requestStudentAccount(studentId, password) {
+    return apiRequest("/api/auth/student-account-requests", {
+        method: "POST",
+        body: JSON.stringify({ student_id: studentId, password })
+    });
+}
+
+export function logout({ revoke = true } = {}) {
+    const token = authState.token;
     authState.token = null;
     authState.user = null;
     localStorage.removeItem("token");
     localStorage.removeItem("user");
+    activeRequests.forEach(controller => controller.abort());
+    activeRequests.clear();
+    window.dispatchEvent(new Event("educare:session-ended"));
+
+    if (revoke && token) {
+        fetch(`${API_BASE}/api/auth/logout`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` }
+        }).catch(error => console.error("Could not revoke the signed-out session:", error));
+    }
 }
 
 // Students API
@@ -175,6 +238,16 @@ export function getDataQualityLog() {
 
 export function getModelMetrics() {
     return apiRequest("/api/admin/model-metrics");
+}
+
+export function getStudentAccountRequests() {
+    return apiRequest("/api/admin/account-requests");
+}
+
+export function reviewStudentAccountRequest(requestId, decision) {
+    return apiRequest(`/api/admin/account-requests/${requestId}/${decision}`, {
+        method: "POST"
+    });
 }
 
 export function uploadCsvFiles(formData) {

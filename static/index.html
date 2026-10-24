@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>EduCare | Student Success Platform</title>
   <meta name="description" content="EduCare: A simple, clear student success dashboard for college faculty, administrators, and students to track learning and support needs.">
-  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/style.css?v=sidebar-nav-20261024">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -61,40 +61,51 @@
   <!-- Login Modal in Plain Language -->
   <div class="login-backdrop" id="login-modal" style="display: none;">
     <div class="login-card">
-      <div class="institutional-badge" style="margin-bottom: 6px;">EduCare · Student Success</div>
+      <div class="institutional-badge login-brand">EduCare · Student Success</div>
+      <div id="login-panel">
       <h2>Sign in to your account</h2>
       <p>A simple portal for teachers, administrators, and students to track learning progress.</p>
 
       <form id="login-form">
         <div class="form-group">
           <label for="login-username">Username or Roll Number</label>
-          <input type="text" id="login-username" class="form-control" placeholder="e.g. admin or prof_sharma or 21CIV036" required autofocus>
+          <input type="text" id="login-username" class="form-control" placeholder="Enter your username or roll number" required autofocus>
         </div>
 
-        <div class="form-group" style="margin-bottom: 22px;">
+        <div class="form-group">
           <label for="login-password">Password</label>
           <input type="password" id="login-password" class="form-control" placeholder="Enter password" required>
         </div>
 
-        <button type="submit" class="btn-primary" style="width: 100%; padding: 11px;" id="btn-login-submit">Sign In</button>
+        <button type="submit" class="btn-primary" id="btn-login-submit">Sign In</button>
       </form>
 
       <div id="login-error-msg" style="color: var(--status-urgent); font-size: 13px; margin-top: 12px; display: none;"></div>
-
-      <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border-hairline);">
-        <div class="filter-label" style="margin-bottom: 8px;">Demo Fast-Access Accounts:</div>
-        <div style="display: flex; flex-direction: column; gap: 6px;">
-          <button type="button" class="btn-outline" style="text-align: left; font-size: 12px;" id="quick-login-admin">
-            <strong>ADMIN:</strong> admin / admin123 (All college data)
-          </button>
-          <button type="button" class="btn-outline" style="text-align: left; font-size: 12px;" id="quick-login-faculty">
-            <strong>FACULTY:</strong> prof_sharma / faculty123 (Teacher view, 120 students)
-          </button>
-          <button type="button" class="btn-outline" style="text-align: left; font-size: 12px;" id="quick-login-student">
-            <strong>STUDENT:</strong> 21CIV036 / student123 (Student view)
-          </button>
-        </div>
+      <div class="login-divider">
+        <button class="btn-outline" type="button" id="google-signin" disabled>Continue with Google</button>
+        <p class="oauth-setup-note">Google sign-in is unavailable until server-side OAuth is configured.</p>
       </div>
+      <p class="login-switch">New student? <button type="button" class="link-button" id="show-register">Create an account</button></p>
+      </div>
+
+      <section id="registration-panel" hidden>
+        <h2>Request a student account</h2>
+        <p>Requests are limited to existing student records and require administrator approval.</p>
+        <form id="register-form">
+          <div class="form-group">
+            <label for="register-student-id">Student ID / Roll Number</label>
+            <input type="text" id="register-student-id" class="form-control" autocomplete="username" required minlength="3" maxlength="50">
+          </div>
+          <div class="form-group">
+            <label for="register-password">Password</label>
+            <input type="password" id="register-password" class="form-control" autocomplete="new-password" required minlength="12" maxlength="72">
+            <small>Use at least 12 characters. Your account will be available after review.</small>
+          </div>
+          <button type="submit" class="btn-primary" id="btn-register-submit" style="width: 100%; padding: 11px;">Request Student Account</button>
+        </form>
+        <div id="registration-error-msg" role="status" aria-live="polite"></div>
+        <p class="login-switch">Already have an account? <button type="button" class="link-button" id="show-login">Sign in</button></p>
+      </section>
     </div>
   </div>
 

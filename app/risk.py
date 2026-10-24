@@ -2,6 +2,16 @@ from typing import Tuple, List
 from app.models import UnifiedStudentMetrics
 
 
+def overall_risk_level(academic_level: str, placement_level: str) -> str:
+    """Return the highest support level across academics and placement readiness."""
+    levels = {"Low": 0, "Medium": 1, "High": 2}
+    highest = max(
+        levels.get(academic_level, 0),
+        levels.get(placement_level, 0)
+    )
+    return {value: key for key, value in levels.items()}[highest]
+
+
 def evaluate_academic_risk(
     metrics: UnifiedStudentMetrics,
     year: int = 3,

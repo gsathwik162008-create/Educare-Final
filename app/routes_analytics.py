@@ -13,9 +13,15 @@ from app.models import (
     SemesterHistory,
     SubjectRecord
 )
-from app.auth import get_current_user
+from app.auth import get_current_user, require_role
+from app.ingestion import DEPT_MAPPING, normalize_department
+from app.risk import overall_risk_level
 
-router = APIRouter(prefix="/api/analytics", tags=["analytics"])
+router = APIRouter(
+    prefix="/api/analytics",
+    tags=["analytics"],
+    dependencies=[Depends(require_role(["ADMIN", "FACULTY"]))]
+)
 
 
 def get_scoped_student_ids(current_user: User, db: Session) -> Optional[List[str]]:
@@ -59,7 +65,16 @@ def get_cohort_overview(
     if scoped_sids is not None:
         query = query.filter(Student.student_id.in_(scoped_sids))
     if department and department != "All":
-        query = query.filter(Student.department == department)
+        canonical_department = normalize_department(department)
+        department_values = {
+            alias.casefold()
+            for alias, canonical in DEPT_MAPPING.items()
+            if canonical.casefold() == canonical_department.casefold()
+        }
+        department_values.add(canonical_department.casefold())
+        query = query.filter(
+            func.lower(func.trim(Student.department)).in_(department_values)
+        )
     if year and year != 0:
         query = query.filter(Student.year == year)
 
@@ -72,6 +87,7 @@ def get_cohort_overview(
             "at_risk_count": 0,
             "placement_ready_count": 0,
             "avg_attendance": 0.0,
+            "risk_distribution": {"High": 0, "Medium": 0, "Low": 0},
             "score_distribution": [],
             "department_heatmap": []
         }
@@ -79,10 +95,13 @@ def get_cohort_overview(
     total_score_sum = sum(sc.total_success_score for _, sc, _ in records)
     avg_score = round(total_score_sum / total_count, 1)
 
-    at_risk_count = sum(
-        1 for _, sc, _ in records
-        if sc.academic_risk_level == "High" or sc.placement_risk_level == "High"
-    )
+    risk_distribution = {"High": 0, "Medium": 0, "Low": 0}
+    for _, score, _ in records:
+        risk_distribution[overall_risk_level(
+            score.academic_risk_level,
+            score.placement_risk_level,
+        )] += 1
+    at_risk_count = risk_distribution["High"]
 
     placement_ready_count = sum(
         1 for _, sc, _ in records
@@ -116,21 +135,30 @@ def get_cohort_overview(
     # Department Heatmap
     dept_groups: Dict[str, List] = {}
     for st, sc, m in records:
-        dept_groups.setdefault(st.department, []).append((st, sc, m))
+        department_name = normalize_department(st.department)
+        dept_groups.setdefault(department_name, []).append((st, sc, m))
 
     dept_heatmap = []
-    for d_name, d_recs in sorted(dept_groups.items()):
+    for d_name in sorted(dept_groups, key=str.casefold):
+        d_recs = dept_groups[d_name]
         cnt = len(d_recs)
         d_avg_score = round(sum(sc.total_success_score for _, sc, _ in d_recs) / cnt, 1)
         d_avg_att = round(sum(m.attendance_pct for _, _, m in d_recs) / cnt, 1)
         d_avg_place = round(sum(sc.placement_score for _, sc, _ in d_recs) / cnt, 1)
-        d_high_risk = sum(1 for _, sc, _ in d_recs if sc.academic_risk_level == "High" or sc.placement_risk_level == "High")
+        d_risk_counts = {"High": 0, "Medium": 0, "Low": 0}
+        for _, score, _ in d_recs:
+            d_risk_counts[overall_risk_level(
+                score.academic_risk_level,
+                score.placement_risk_level,
+            )] += 1
+        d_high_risk = d_risk_counts["High"]
         dept_heatmap.append({
             "department": d_name,
             "student_count": cnt,
             "avg_score": d_avg_score,
             "avg_attendance": d_avg_att,
             "avg_placement": d_avg_place,
+            "risk_counts": d_risk_counts,
             "high_risk_count": d_high_risk,
             "risk_rate_pct": round((d_high_risk / cnt) * 100, 1)
         })
@@ -143,6 +171,7 @@ def get_cohort_overview(
         "placement_ready_count": placement_ready_count,
         "placement_ready_pct": round((placement_ready_count / total_count) * 100, 1),
         "avg_attendance": avg_attendance,
+        "risk_distribution": risk_distribution,
         "score_distribution": score_distribution,
         "department_heatmap": dept_heatmap
     }

@@ -8,6 +8,8 @@ import {
     authState,
     login,
     logout,
+    getCurrentUser,
+    requestStudentAccount,
     getOverview,
     getTrends,
     getStudents,
@@ -25,6 +27,8 @@ import {
     recomputeAnalytics,
     getDataQualityLog,
     getModelMetrics,
+    getStudentAccountRequests,
+    reviewStudentAccountRequest,
     uploadCsvFiles,
     getExplain,
     askCampusAI
@@ -47,6 +51,7 @@ import {
     formatGpa,
     helpTip
 } from "./labels.js";
+import { escapeHtml } from "./security.js";
 
 // Active Chart.js instances registry for proper teardown
 let activeCharts = [];
@@ -56,6 +61,151 @@ function destroyActiveCharts() {
         try { c.destroy(); } catch (e) { }
     });
     activeCharts = [];
+}
+
+if (typeof Chart !== "undefined") {
+    Chart.register({
+        id: "educareReadableBarValues",
+        afterDatasetsDraw(chart) {
+            if (chart.config.type !== "bar") return;
+            const context = chart.ctx;
+            const horizontal = chart.options.indexAxis === "y";
+            if (chart.canvas.id === "chart-dept-overview" && !horizontal) {
+                const chartArea = chart.chartArea;
+                const labelHeight = 13;
+                const labelGap = 3;
+                const occupiedLabels = [];
+                const pendingLabels = [];
+                context.save();
+                context.font = '600 10px "IBM Plex Sans", sans-serif';
+                context.textAlign = "center";
+                context.textBaseline = "middle";
+
+                chart.data.datasets.forEach((dataset, datasetIndex) => {
+                    const meta = chart.getDatasetMeta(datasetIndex);
+                    if (meta.hidden) return;
+                    meta.data.forEach((element, index) => {
+                        const value = Number(dataset.data[index]);
+                        if (!Number.isFinite(value) || value <= 0) return;
+                        const segmentTop = Math.min(element.y, element.base);
+                        const segmentBottom = Math.max(element.y, element.base);
+                        const position = {
+                            x: element.x,
+                            y: (segmentTop + segmentBottom) / 2
+                        };
+                        const label = Math.round(value).toLocaleString();
+                        const textWidth = context.measureText(label).width;
+                        const halfWidth = textWidth / 2 + 3;
+                        const rightEdge = element.x + element.width / 2;
+                        const leftEdge = element.x - element.width / 2;
+                        const rightFits = rightEdge + 5 + textWidth <= chartArea.right;
+                        pendingLabels.push({
+                            label,
+                            position,
+                            textWidth,
+                            elementWidth: element.width,
+                            x: rightFits ? rightEdge + 5 : leftEdge - 5,
+                            direction: rightFits ? 1 : -1,
+                            halfWidth,
+                            targetY: position.y
+                        });
+                    });
+                });
+
+                pendingLabels.sort((first, second) => first.targetY - second.targetY);
+                pendingLabels.forEach(item => {
+                    const halfWidth = item.halfWidth;
+                    const x = Math.max(
+                        chartArea.left + halfWidth,
+                        Math.min(chartArea.right - halfWidth, item.x)
+                    );
+                    const left = item.direction > 0 ? x - 3 : x - item.textWidth - 3;
+                    const right = item.direction > 0 ? x + item.textWidth + 3 : x + 3;
+                    const minY = chartArea.top + labelHeight / 2 + 1;
+                    const maxY = chartArea.bottom - labelHeight / 2 - 1;
+                    const targetY = Math.max(minY, Math.min(maxY, item.targetY));
+                    const offsets = [0];
+                    for (let offset = labelHeight + labelGap; offset <= chartArea.height; offset += labelHeight + labelGap) {
+                        offsets.push(-offset, offset);
+                    }
+                    let y = targetY;
+                    for (const offset of offsets) {
+                        const candidateY = targetY + offset;
+                        if (candidateY < minY || candidateY > maxY) continue;
+                        const candidate = {
+                            left,
+                            right,
+                            top: candidateY - labelHeight / 2,
+                            bottom: candidateY + labelHeight / 2
+                        };
+                        const overlaps = occupiedLabels.some(occupied =>
+                            candidate.left < occupied.right + labelGap &&
+                            candidate.right + labelGap > occupied.left &&
+                            candidate.top < occupied.bottom + labelGap &&
+                            candidate.bottom + labelGap > occupied.top
+                        );
+                        if (!overlaps) {
+                            y = candidateY;
+                            break;
+                        }
+                    }
+                    item.bounds = {
+                        left,
+                        right,
+                        top: y - labelHeight / 2,
+                        bottom: y + labelHeight / 2
+                    };
+
+                    context.save();
+                    context.textAlign = item.direction > 0 ? "left" : "right";
+                    context.strokeStyle = "rgba(255, 255, 255, 0.96)";
+                    context.lineWidth = 3;
+                    context.lineJoin = "round";
+                    context.strokeText(item.label, x, y);
+                    context.fillStyle = "#263238";
+                    context.fillText(item.label, x, y);
+                    const segmentEdge = item.direction > 0
+                        ? item.position.x + item.elementWidth / 2
+                        : item.position.x - item.elementWidth / 2;
+                    const labelEdge = item.direction > 0 ? left : right;
+                    context.beginPath();
+                    context.strokeStyle = "#52606D";
+                    context.lineWidth = 1;
+                    context.moveTo(segmentEdge, item.position.y);
+                    context.lineTo(labelEdge, y);
+                    context.stroke();
+                    context.restore();
+                    occupiedLabels.push(item.bounds);
+                });
+                context.restore();
+                return;
+            }
+            context.save();
+            context.font = '600 10px "IBM Plex Sans", sans-serif';
+            context.textAlign = "center";
+            chart.data.datasets.forEach((dataset, datasetIndex) => {
+                const meta = chart.getDatasetMeta(datasetIndex);
+                if (meta.hidden) return;
+                meta.data.forEach((element, index) => {
+                    const value = Number(dataset.data[index]);
+                    if (!Number.isFinite(value)) return;
+                    const dimension = horizontal ? element.width : element.height;
+                    if (dimension < 16 || element.width < 22) return;
+                    const position = element.tooltipPosition();
+                    const stacked = chart.options.scales?.x?.stacked && !horizontal;
+                    context.fillStyle = stacked ? "#FFFFFF" : "#52606D";
+                    context.textBaseline = stacked ? "middle" : "bottom";
+                    context.fillText(
+                        Math.round(value).toLocaleString(),
+                        position.x,
+                        stacked || horizontal ? position.y : position.y - 4
+                    );
+                });
+            });
+            context.restore();
+        }
+    });
+    Chart.defaults.animation.duration = 220;
 }
 
 // Global active view state
@@ -72,60 +222,132 @@ document.addEventListener("DOMContentLoaded", () => {
 /* ==========================================================================
    AUTHENTICATION & NAVIGATION SETUP
    ========================================================================== */
-function initAuthAndNavigation() {
-    const loginModal = document.getElementById("login-modal");
+async function initAuthAndNavigation() {
     const loginForm = document.getElementById("login-form");
-    const btnLogout = document.getElementById("btn-logout");
+    const registrationForm = document.getElementById("register-form");
+    const loginPanel = document.getElementById("login-panel");
+    const registrationPanel = document.getElementById("registration-panel");
 
-    // Quick demo buttons
-    document.getElementById("quick-login-admin").addEventListener("click", () => {
-        document.getElementById("login-username").value = "admin";
-        document.getElementById("login-password").value = "admin123";
+    window.addEventListener("educare:session-ended", showSignedOutScreen);
+    window.addEventListener("storage", event => {
+        if (event.key === "token" && !event.newValue) logout({ revoke: false });
     });
-    document.getElementById("quick-login-faculty").addEventListener("click", () => {
-        document.getElementById("login-username").value = "prof_sharma";
-        document.getElementById("login-password").value = "faculty123";
+    window.addEventListener("pageshow", event => {
+        if (event.persisted) validateStoredSession();
     });
-    document.getElementById("quick-login-student").addEventListener("click", () => {
-        document.getElementById("login-username").value = "21CIV036";
-        document.getElementById("login-password").value = "student123";
+    window.addEventListener("popstate", () => {
+        if (!authState.token) showSignedOutScreen();
     });
 
-    loginForm.addEventListener("submit", async (e) => {
-        e.preventDefault();
+    loginForm.addEventListener("submit", async event => {
+        event.preventDefault();
         const errEl = document.getElementById("login-error-msg");
+        const submit = document.getElementById("btn-login-submit");
+        errEl.textContent = "";
         errEl.style.display = "none";
-        const u = document.getElementById("login-username").value.trim();
-        const p = document.getElementById("login-password").value.trim();
-
+        submit.disabled = true;
+        submit.textContent = "Signing in...";
         try {
-            await login(u, p);
-            currentSelectedStudentId = null;
-            loginModal.style.display = "none";
-            setupSidebarForUser();
-            navigateToDefaultScreen();
-            checkAndTriggerFirstTimeTour();
+            await login(
+                document.getElementById("login-username").value.trim(),
+                document.getElementById("login-password").value
+            );
+            await enterAuthenticatedApp();
         } catch (err) {
             errEl.textContent = err.message || "Invalid username or password.";
             errEl.style.display = "block";
+        } finally {
+            submit.disabled = false;
+            submit.textContent = "Sign In";
         }
     });
 
-    btnLogout.addEventListener("click", () => {
-        logout();
-        currentSelectedStudentId = null;
-        loginModal.style.display = "flex";
-        setupSidebarForUser();
+    document.getElementById("btn-logout").addEventListener("click", () => logout());
+    document.getElementById("show-register").addEventListener("click", () => {
+        loginPanel.hidden = true;
+        registrationPanel.hidden = false;
+        document.getElementById("registration-error-msg").textContent = "";
+    });
+    document.getElementById("show-login").addEventListener("click", () => {
+        registrationPanel.hidden = true;
+        loginPanel.hidden = false;
+    });
+    registrationForm.addEventListener("submit", async event => {
+        event.preventDefault();
+        const submit = document.getElementById("btn-register-submit");
+        const message = document.getElementById("registration-error-msg");
+        submit.disabled = true;
+        submit.textContent = "Submitting...";
+        message.textContent = "";
+        try {
+            const result = await requestStudentAccount(
+                document.getElementById("register-student-id").value.trim(),
+                document.getElementById("register-password").value
+            );
+            message.textContent = result.message;
+            registrationForm.reset();
+        } catch (err) {
+            message.textContent = err.message;
+        } finally {
+            submit.disabled = false;
+            submit.textContent = "Request Student Account";
+        }
     });
 
+    showSignedOutScreen();
+    await validateStoredSession();
+}
+
+function showSignedOutScreen() {
+    document.body.classList.remove("authenticated");
+    document.getElementById("login-modal").style.display = "flex";
+    document.getElementById("tour-modal").style.display = "none";
+    document.getElementById("help-popover").classList.remove("visible");
+    const oldScreen = document.getElementById("screen-container");
+    const newScreen = document.createElement("div");
+    newScreen.id = "screen-container";
+    oldScreen.replaceWith(newScreen);
+    document.getElementById("nav-menu").replaceChildren();
+    document.getElementById("register-form").reset();
+    document.getElementById("registration-panel").hidden = true;
+    document.getElementById("login-panel").hidden = false;
+    document.getElementById("registration-error-msg").textContent = "";
+    document.getElementById("user-display-name").textContent = "Not Signed In";
+    document.getElementById("user-role-label").textContent = "GUEST";
+    document.getElementById("login-form").reset();
+    currentSelectedStudentId = null;
+    currentScreen = "overview";
+    destroyActiveCharts();
+}
+
+async function validateStoredSession() {
     if (!authState.token || !authState.user) {
-        loginModal.style.display = "flex";
-    } else {
-        loginModal.style.display = "none";
-        setupSidebarForUser();
-        navigateToDefaultScreen();
-        checkAndTriggerFirstTimeTour();
+        showSignedOutScreen();
+        return;
     }
+    try {
+        await enterAuthenticatedApp();
+    } catch {
+        logout({ revoke: false });
+        showSignedOutScreen();
+    }
+}
+
+async function enterAuthenticatedApp() {
+    const user = await getCurrentUser();
+    authState.user = {
+        username: user.username,
+        role: user.role,
+        name: user.faculty_name || user.student_id || user.username,
+        student_id: user.student_id
+    };
+    localStorage.setItem("user", JSON.stringify(authState.user));
+    document.body.classList.add("authenticated");
+    document.getElementById("login-modal").style.display = "none";
+    currentSelectedStudentId = null;
+    setupSidebarForUser();
+    navigateToDefaultScreen();
+    checkAndTriggerFirstTimeTour();
 }
 
 function setupSidebarForUser() {
@@ -161,29 +383,55 @@ function setupSidebarForUser() {
     } else {
         navHeader.textContent = user.role === "ADMIN" ? "Administrator Views" : "Teacher & Advisor Views";
         let items = `
-            <li class="nav-item active" data-screen="overview">1. ${LABELS.nav.overview}</li>
-            <li class="nav-item" data-screen="trends">2. ${LABELS.nav.trends}</li>
-            <li class="nav-item" data-screen="risk-explorer">3. ${LABELS.nav.riskExplorer}</li>
-            <li class="nav-item" data-screen="action-list">4. ${LABELS.nav.actionList}</li>
-            <li class="nav-item" data-screen="student-profile">5. ${LABELS.nav.studentProfile}</li>
-            <li class="nav-item" data-screen="segments">6. ${LABELS.nav.segments}</li>
-            <li class="nav-item" data-screen="insights">7. ${LABELS.nav.insights}</li>
-            <li class="nav-item" data-screen="score-guide">8. ${LABELS.nav.scoreGuide}</li>
+            <li class="nav-item active" data-screen="overview">${LABELS.nav.overview}</li>
+            <li class="nav-item" data-screen="trends">${LABELS.nav.trends}</li>
+            <li class="nav-item" data-screen="risk-explorer">${LABELS.nav.riskExplorer}</li>
+            <li class="nav-item" data-screen="action-list">${LABELS.nav.actionList}</li>
+            <li class="nav-item" data-screen="student-profile">${LABELS.nav.studentProfile}</li>
+            <li class="nav-item" data-screen="segments">${LABELS.nav.segments}</li>
+            <li class="nav-item" data-screen="insights">${LABELS.nav.insights}</li>
+            <li class="nav-item" data-screen="score-guide">${LABELS.nav.scoreGuide}</li>
             <li class="nav-item" data-screen="inbox">Inbox <span class="nav-badge" id="inbox-open-count">0</span></li>
         `;
 
         if (user.role === "ADMIN") {
             items += `
-                <li class="nav-item" data-screen="data-quality">9. ${LABELS.nav.dataQuality}</li>
-                <li class="nav-item" data-screen="model-settings">10. ${LABELS.nav.modelSettings}</li>
+                <li class="nav-item" data-screen="data-quality">${LABELS.nav.dataQuality}</li>
+                <li class="nav-item" data-screen="model-settings">${LABELS.nav.modelSettings}</li>
+                <li class="nav-item" data-screen="account-requests">Student Account Requests</li>
             `;
         }
 
         navMenu.innerHTML = items;
     }
 
-    // Attach click events to nav items
+    const navIconPaths = {
+        overview: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+        trends: '<path d="M3 17l6-6 4 4 8-9"/><path d="M15 6h6v6"/>',
+        "risk-explorer": '<path d="M12 3l8 3v5c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-3z"/><path d="M12 8v5"/><path d="M12 16h.01"/>',
+        "action-list": '<path d="M9 6h11"/><path d="M9 12h11"/><path d="M9 18h11"/><path d="M4 6h.01"/><path d="M4 12h.01"/><path d="M4 18h.01"/>',
+        "student-profile": '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+        segments: '<path d="M12 3a9 9 0 1 0 9 9h-9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/>',
+        insights: '<path d="M9 18h6"/><path d="M10 22h4"/><path d="M8.5 14.5A7 7 0 1 1 15.5 14c-.8.6-1.2 1.2-1.4 2h-4.2c-.2-.6-.6-1.1-1.4-1.5z"/>',
+        "score-guide": '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 0 4 22z"/><path d="M4 5.5v16.5"/><path d="M8 7h8"/>',
+        inbox: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 12h5l2 3h4l2-3h5"/><path d="m4 6 8 6 8-6"/>',
+        "data-quality": '<path d="M4 5h16"/><path d="M4 12h10"/><path d="M4 19h8"/><path d="m16 17 2 2 4-5"/>',
+        "model-settings": '<circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.7a8 8 0 0 1-1.7 1l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-1.7-1l-1.7.7-1.4-2.4 1.4-1.1a7 7 0 0 1 0-2l-1.4-1.1 1.4-2.4 1.7.7a8 8 0 0 1 1.7-1l.3-1.8h2.8l.3 1.8a8 8 0 0 1 1.7 1l1.7-.7 1.4 2.4-1.4 1.1a7 7 0 0 1 0 2z"/>',
+        "account-requests": '<circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0"/><path d="M19 8v6"/><path d="M16 11h6"/>',
+        "student-portal": '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+        "student-whatif": '<path d="M4 19V5"/><path d="M4 19h16"/><path d="m7 15 4-5 3 2 5-7"/>',
+        "student-actions": '<path d="m5 12 4 4L19 6"/>',
+        "student-mentor": '<path d="M4 5h16v12H9l-5 4z"/><path d="M8 10h8"/><path d="M8 13h5"/>'
+    };
+
+    // Attach icons and click events to nav items.
     navMenu.querySelectorAll(".nav-item").forEach(item => {
+        const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        icon.setAttribute("class", "nav-icon");
+        icon.setAttribute("viewBox", "0 0 24 24");
+        icon.setAttribute("aria-hidden", "true");
+        icon.innerHTML = navIconPaths[item.dataset.screen] || navIconPaths.inbox;
+        item.prepend(icon);
         item.addEventListener("click", () => {
             navMenu.querySelectorAll(".nav-item").forEach(el => el.classList.remove("active"));
             item.classList.add("active");
@@ -272,22 +520,15 @@ export function navigateToScreen(screenName, extraParam = null) {
         case "model-settings":
             renderModelSettingsScreen();
             break;
+        case "account-requests":
+            renderStudentAccountRequestsScreen();
+            break;
         case "inbox":
             renderInboxScreen();
             break;
         default:
             renderOverviewScreen();
     }
-}
-
-function escapeInboxHtml(value) {
-    return String(value ?? "").replace(/[&<>"']/g, character => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        "\"": "&quot;",
-        "'": "&#39;"
-    })[character]);
 }
 
 async function renderInboxScreen() {
@@ -308,12 +549,12 @@ async function renderInboxScreen() {
                     : messages.map(message => `
                         <article class="inbox-message" style="padding: 16px 0; border-bottom: 1px solid var(--border-hairline);">
                             <div style="display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px;">
-                                <strong>${escapeInboxHtml(message.student_name)}</strong>
-                                <span style="color: var(--text-muted); font-size: 12px;">${escapeInboxHtml(message.created_at ? message.created_at.replace("T", " ").slice(0, 16) : "")}</span>
+                                <strong>${escapeHtml(message.student_name)}</strong>
+                                <span style="color: var(--text-muted); font-size: 12px;">${escapeHtml(message.created_at ? message.created_at.replace("T", " ").slice(0, 16) : "")}</span>
                             </div>
-                            <p style="white-space: pre-wrap; margin-bottom: 12px;">${escapeInboxHtml(message.message.length > 240 ? `${message.message.slice(0, 240)}...` : message.message)}</p>
+                            <p style="white-space: pre-wrap; margin-bottom: 12px;">${escapeHtml(message.message.length > 240 ? `${message.message.slice(0, 240)}...` : message.message)}</p>
                             <form class="inbox-reply-form" data-message-id="${message.id}">
-                                <label class="sr-only" for="inbox-reply-${message.id}">Reply to ${escapeInboxHtml(message.student_name)}</label>
+                                <label class="sr-only" for="inbox-reply-${message.id}">Reply to ${escapeHtml(message.student_name)}</label>
                                 <textarea id="inbox-reply-${message.id}" class="form-control" rows="3" placeholder="Write a reply..." required></textarea>
                                 <button type="submit" class="btn-primary" style="margin-top: 8px;">Send Reply</button>
                             </form>
@@ -341,7 +582,7 @@ async function renderInboxScreen() {
             });
         });
     } catch (err) {
-        container.innerHTML = `<div class="state-container"><p>Could not load inbox: ${escapeInboxHtml(err.message)}</p></div>`;
+        container.innerHTML = `<div class="state-container"><p>Could not load inbox: ${escapeHtml(err.message)}</p></div>`;
     }
 }
 
@@ -515,10 +756,9 @@ async function renderOverviewScreen() {
                     <div class="summary-card-header">
                         <span class="summary-label">Total Students ${helpTip("All students currently enrolled in the selected department and year.")}</span>
                     </div>
-                    <div class="summary-value mono-num">${totalStudents}</div>
+                    <div class="summary-value mono-num" id="overview-total-students">${totalStudents}</div>
                     <div class="summary-change-row">
-                        <span class="change-pill change-neutral">+12</span>
-                        <span class="change-text">vs last semester</span>
+                        <span class="change-text">In the selected cohort</span>
                     </div>
                 </div>
 
@@ -526,10 +766,9 @@ async function renderOverviewScreen() {
                     <div class="summary-card-header">
                         <span class="summary-label">Average ${LABELS.scoreName} ${helpTip(LABELS.scoreHelp)}</span>
                     </div>
-                    <div class="summary-value mono-num" style="color: var(--accent-teal);">${avgScore} <span style="font-size: 16px; font-weight: normal; color: var(--text-muted);">${LABELS.scoreOutScores}</span></div>
+                    <div class="summary-value mono-num" style="color: var(--accent-teal);"><span id="overview-average-score">${avgScore}</span> <span style="font-size: 16px; font-weight: normal; color: var(--text-muted);">${LABELS.scoreOutScores}</span></div>
                     <div class="summary-change-row">
-                        <span class="change-pill change-up">+2 pts</span>
-                        <span class="change-text">vs last semester</span>
+                        <span class="change-text">Average for the selected cohort</span>
                     </div>
                 </div>
 
@@ -537,10 +776,9 @@ async function renderOverviewScreen() {
                     <div class="summary-card-header">
                         <span class="summary-label">${LABELS.attentionUrgent} ${helpTip("Students who need immediate support from advisors for academics or job prep.")}</span>
                     </div>
-                    <div class="summary-value mono-num" style="color: var(--status-urgent);">${urgentCount} <span style="font-size: 16px; font-weight: normal; color: var(--text-muted);">(${urgentPct})</span></div>
+                    <div class="summary-value mono-num" style="color: var(--status-urgent);"><span id="overview-urgent-count">${urgentCount}</span> <span id="overview-urgent-percent" style="font-size: 16px; font-weight: normal; color: var(--text-muted);">(${urgentPct})</span></div>
                     <div class="summary-change-row">
-                        <span class="change-pill change-down">-5</span>
-                        <span class="change-text">vs last semester (improving)</span>
+                        <span class="change-text">Urgent support in the selected cohort</span>
                     </div>
                 </div>
 
@@ -548,10 +786,9 @@ async function renderOverviewScreen() {
                     <div class="summary-card-header">
                         <span class="summary-label">Job Readiness On Track ${helpTip("Students with strong coding, interview, and test preparation scores.")}</span>
                     </div>
-                    <div class="summary-value mono-num" style="color: var(--status-fine);">${placementCount} <span style="font-size: 16px; font-weight: normal; color: var(--text-muted);">(${placementPct})</span></div>
+                    <div class="summary-value mono-num" style="color: var(--status-fine);"><span id="overview-placement-count">${placementCount}</span> <span id="overview-placement-percent" style="font-size: 16px; font-weight: normal; color: var(--text-muted);">(${placementPct})</span></div>
                     <div class="summary-change-row">
-                        <span class="change-pill change-up">+14</span>
-                        <span class="change-text">vs last semester</span>
+                        <span class="change-text">Placement-ready in the selected cohort</span>
                     </div>
                 </div>
             </div>
@@ -565,9 +802,7 @@ async function renderOverviewScreen() {
                         </div>
                         <div class="card-how-to-read">How to read this: Each bar shows how many students have scores in that 10-point bracket.</div>
                     </div>
-                    <div class="card-takeaway" id="takeaway-score-dist">
-                        Most students (${Math.round(((data.total_students - data.at_risk_count) / Math.max(data.total_students, 1)) * 100)}%) are doing fine with scores above 60 out of 100.
-                    </div>
+                    <div class="card-takeaway" id="takeaway-score-dist">Student success score distribution in the selected cohort.</div>
                     <div class="chart-box-md">
                         <canvas id="chart-score-dist"></canvas>
                     </div>
@@ -576,15 +811,28 @@ async function renderOverviewScreen() {
                 <div class="col-6 content-card">
                     <div class="card-header">
                         <div class="card-title-row">
-                            <h2 class="card-title">Which departments need the most support? ${helpTip("Compares student support needs across the five engineering departments.")}</h2>
+                            <h2 class="card-title">How is overall risk distributed? ${helpTip("Each student is counted once, using the highest of academic and placement risk levels.")}</h2>
                         </div>
-                        <div class="card-how-to-read">How to read this: Shows students needing urgent attention in each department.</div>
-                    </div>
-                    <div class="card-takeaway" id="takeaway-dept-risk">
-                        Computer Science has the highest average score (${data.department_heatmap.find(d => d.department === 'CSE')?.avg_score || 75} out of 100), while Civil has the most urgent cases.
+                        <div class="card-how-to-read">Risk counts reflect the selected department and year.</div>
                     </div>
                     <div class="chart-box-md">
-                        <canvas id="chart-dept-overview"></canvas>
+                        <canvas id="chart-risk-distribution" role="img" aria-label="Student risk distribution"></canvas>
+                    </div>
+                </div>
+
+                <div class="col-12 content-card">
+                    <div class="card-header">
+                        <div class="card-title-row">
+                            <h2 class="card-title">How are support levels distributed by department? ${helpTip("Departments are compared by counts of students in each overall risk category.")}</h2>
+                        </div>
+                        <div class="card-how-to-read">How to read this: Each department bar is stacked by overall risk category.</div>
+                    </div>
+                    <div class="chart-data-note" id="chart-dept-overview-note" role="status" style="display: none;"></div>
+                    <div class="chart-box-md chart-box-department" id="chart-dept-overview-container">
+                        <canvas id="chart-dept-overview" role="img" aria-label="Stacked student support levels by department"></canvas>
+                        <div class="chart-state" id="chart-dept-overview-empty" role="status" style="display: none;">
+                            No department data matches the selected filters.
+                        </div>
                     </div>
                 </div>
             </div>
@@ -616,12 +864,12 @@ async function renderOverviewScreen() {
                                 <th>Attention Status</th>
                             </tr>
                         </thead>
-                        <tbody>
+                        <tbody id="overview-department-rows">
                             ${data.department_heatmap.map(d => {
                                 const statusHtml = d.high_risk_count > 12 ? getAttentionBadgeHtml("high") : (d.high_risk_count > 6 ? getAttentionBadgeHtml("medium") : getAttentionBadgeHtml("low"));
                                 return `
                                     <tr>
-                                        <td><strong>${d.department}</strong></td>
+                                        <td><strong>${escapeHtml(d.department)}</strong></td>
                                         <td class="num-col mono-num">${formatCount(d.student_count)}</td>
                                         <td class="num-col mono-num">${formatScore(d.avg_score)} / 100</td>
                                         <td class="num-col mono-num">${formatPercent(d.avg_attendance)}</td>
@@ -649,6 +897,7 @@ async function renderOverviewScreen() {
                     label: "Students",
                     data: data.score_distribution.map(b => b.count),
                     backgroundColor: "#0F5C5C",
+                    hoverBackgroundColor: "#147A78",
                     borderRadius: 3
                 }]
             },
@@ -678,50 +927,124 @@ async function renderOverviewScreen() {
         });
         activeCharts.push(chart1);
 
-        // Chart 2: Department Overview (Fixed order & colors)
+        // Chart 2: Overall risk distribution
         const ctx2 = document.getElementById("chart-dept-overview").getContext("2d");
-        const deptLabels = LABELS.departments.map(d => d.code);
-        const deptUrgentData = deptLabels.map(code => {
-            const row = data.department_heatmap.find(d => d.department === code);
-            return row ? row.high_risk_count : 0;
-        });
-
         const chart2 = new Chart(ctx2, {
             type: "bar",
             data: {
-                labels: deptLabels,
-                datasets: [{
-                    label: "Urgent Attention Needed",
-                    data: deptUrgentData,
-                    backgroundColor: LABELS.departments.map(d => d.color),
-                    borderRadius: 3
-                }]
+                labels: data.department_heatmap.map(row => row.department),
+                datasets: [
+                    { label: "Urgent", data: data.department_heatmap.map(row => row.risk_counts.High), backgroundColor: "#C53030", hoverBackgroundColor: "#A61F24", hoverBorderColor: "#7F1D1D", hoverBorderWidth: 1, borderRadius: 3 },
+                    { label: "Soon", data: data.department_heatmap.map(row => row.risk_counts.Medium), backgroundColor: "#B45309", hoverBackgroundColor: "#934306", hoverBorderColor: "#78350F", hoverBorderWidth: 1, borderRadius: 3 },
+                    { label: "Doing fine", data: data.department_heatmap.map(row => row.risk_counts.Low), backgroundColor: "#2E7D32", hoverBackgroundColor: "#246428", hoverBorderColor: "#14532D", hoverBorderWidth: 1, borderRadius: 3 }
+                ]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
+                interaction: { mode: "nearest", intersect: true },
                 plugins: {
-                    legend: { display: false },
+                    legend: { position: "bottom", labels: { usePointStyle: true } },
                     tooltip: {
                         callbacks: {
-                            label: (ctx) => `${ctx.label}: ${ctx.parsed.y} students need urgent attention`
+                            title: items => items.length
+                                ? items[0].chart.data.labels[items[0].dataIndex]
+                                : "",
+                            label: context => {
+                                const total = context.chart.data.datasets.reduce(
+                                    (sum, dataset) => sum + (Number(dataset.data[context.dataIndex]) || 0),
+                                    0
+                                );
+                                const count = Number(context.raw) || 0;
+                                const percent = total ? (count / total * 100).toFixed(1) : "0.0";
+                                const studentLabel = count === 1 ? "student" : "students";
+                                return `${context.dataset.label}: ${count} ${studentLabel} (${percent}%)`;
+                            }
                         }
                     }
                 },
                 scales: {
                     x: {
+                        stacked: true,
                         grid: { display: false },
-                        title: { display: true, text: "Department (standard order)", font: { size: 12 } }
+                        title: { display: true, text: "Department", font: { size: 12 } },
+                        ticks: { autoSkip: false, maxRotation: 0, minRotation: 0 }
                     },
                     y: {
+                        stacked: true,
+                        grace: "20%",
                         grid: { color: "#E3DFD6" },
                         ticks: { precision: 0 },
-                        title: { display: true, text: "Students needing urgent help", font: { size: 12 } }
+                        title: { display: true, text: "Students", font: { size: 12 } }
+                    }
+                },
+                datasets: {
+                    bar: {
+                        categoryPercentage: 0.62,
+                        barPercentage: 0.8,
+                        maxBarThickness: 68
                     }
                 }
             }
         });
         activeCharts.push(chart2);
+        const departmentChartEmpty = document.getElementById("chart-dept-overview-empty");
+        const departmentChartNote = document.getElementById("chart-dept-overview-note");
+        const updateDepartmentChart = departmentRows => {
+            chart2.data.labels = departmentRows.map(row => row.department);
+            chart2.data.datasets.forEach((dataset, index) => {
+                const riskLevel = ["High", "Medium", "Low"][index];
+                dataset.data = departmentRows.map(row => row.risk_counts[riskLevel]);
+            });
+            const hasDepartments = departmentRows.length > 0;
+            chart2.canvas.style.display = hasDepartments ? "block" : "none";
+            departmentChartEmpty.style.display = hasDepartments ? "none" : "flex";
+            departmentChartNote.style.display = departmentRows.length === 1 ? "block" : "none";
+            departmentChartNote.textContent = departmentRows.length === 1
+                ? `Only ${departmentRows[0].department} has student records for these filters; comparison is limited.`
+                : "";
+            chart2.update();
+        };
+        updateDepartmentChart(data.department_heatmap);
+
+        const riskChart = new Chart(document.getElementById("chart-risk-distribution").getContext("2d"), {
+            type: "doughnut",
+            data: {
+                labels: ["Urgent", "Soon", "Doing fine"],
+                datasets: [{
+                    data: [
+                        data.risk_distribution.High,
+                        data.risk_distribution.Medium,
+                        data.risk_distribution.Low
+                    ],
+                    backgroundColor: ["#C53030", "#B45309", "#2E7D32"],
+                    hoverBackgroundColor: ["#A61F24", "#934306", "#246428"],
+                    hoverOffset: 7,
+                    borderColor: "#FFFFFF",
+                    borderWidth: 2
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                cutout: "62%",
+                interaction: { mode: "nearest", intersect: true },
+                plugins: {
+                    legend: { position: "bottom", labels: { usePointStyle: true } },
+                    tooltip: {
+                        callbacks: {
+                            label: context => {
+                                const total = context.dataset.data.reduce((sum, value) => sum + Number(value || 0), 0);
+                                const count = Number(context.raw) || 0;
+                                const percent = total ? (count / total * 100).toFixed(1) : "0.0";
+                                return `${context.label}: ${count} students (${percent}%)`;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        activeCharts.push(riskChart);
 
         // Filters handler
         const deptFilter = document.getElementById("overview-dept-filter");
@@ -759,6 +1082,34 @@ async function renderOverviewScreen() {
             chart1.data.labels = filteredData.score_distribution.map(b => `${b.range} pts`);
             chart1.data.datasets[0].data = filteredData.score_distribution.map(b => b.count);
             chart1.update();
+            updateDepartmentChart(filteredData.department_heatmap);
+            riskChart.data.datasets[0].data = [
+                filteredData.risk_distribution.High,
+                filteredData.risk_distribution.Medium,
+                filteredData.risk_distribution.Low
+            ];
+            riskChart.update();
+            document.getElementById("overview-total-students").textContent = formatCount(filteredData.total_students);
+            document.getElementById("overview-average-score").textContent = formatScore(filteredData.avg_score);
+            document.getElementById("overview-urgent-count").textContent = formatCount(filteredData.at_risk_count);
+            document.getElementById("overview-urgent-percent").textContent = `(${formatPercent(filteredData.at_risk_pct)})`;
+            document.getElementById("overview-placement-count").textContent = formatCount(filteredData.placement_ready_count);
+            document.getElementById("overview-placement-percent").textContent = `(${formatPercent(filteredData.placement_ready_pct)})`;
+            document.getElementById("overview-department-rows").innerHTML = filteredData.department_heatmap.map(row => {
+                const statusHtml = row.high_risk_count > 12
+                    ? getAttentionBadgeHtml("high")
+                    : (row.high_risk_count > 6 ? getAttentionBadgeHtml("medium") : getAttentionBadgeHtml("low"));
+                return `<tr>
+                    <td><strong>${escapeHtml(row.department)}</strong></td>
+                    <td class="num-col mono-num">${formatCount(row.student_count)}</td>
+                    <td class="num-col mono-num">${formatScore(row.avg_score)} / 100</td>
+                    <td class="num-col mono-num">${formatPercent(row.avg_attendance)}</td>
+                    <td class="num-col mono-num">${formatScore(row.avg_placement)} / 100</td>
+                    <td class="num-col mono-num">${formatCount(row.high_risk_count)}</td>
+                    <td>${statusHtml}</td>
+                </tr>`;
+            }).join("");
+            document.getElementById("overview-table-search").dispatchEvent(new Event("input"));
         };
 
         deptFilter.addEventListener("change", updateFilters);
@@ -773,7 +1124,7 @@ async function renderOverviewScreen() {
         setupSimpleTableSearch("overview-table", "overview-table-search");
 
     } catch (err) {
-        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${err.message}</p></div>`;
+        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${escapeHtml(err.message)}</p></div>`;
     }
 }
 
@@ -892,7 +1243,7 @@ async function renderTrendsScreen() {
                         <tbody>
                             ${trends.department_comparison.map(d => `
                                 <tr>
-                                    <td><strong>${d.department}</strong></td>
+                                    <td><strong>${escapeHtml(d.department)}</strong></td>
                                     <td class="num-col mono-num" style="font-weight: 700; color: var(--accent-teal);">${formatScore(d.avg_score)} / 100</td>
                                     <td class="num-col mono-num">${formatScore(d.avg_academic)}</td>
                                     <td class="num-col mono-num">${formatPercent(d.avg_attendance)}</td>
@@ -993,7 +1344,7 @@ async function renderTrendsScreen() {
         setupSimpleTableSearch("trends-table", "trends-table-search");
 
     } catch (err) {
-        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${err.message}</p></div>`;
+        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${escapeHtml(err.message)}</p></div>`;
     }
 }
 
@@ -1134,7 +1485,7 @@ async function renderRiskExplorerScreen() {
 
             // Update Summary Numbers
             const total = allStudents.length;
-            const urgent = allStudents.filter(s => s.academic_risk_level === "High" || s.placement_risk_level === "High").length;
+            const urgent = allStudents.filter(s => s.overall_risk_level === "High").length;
             const studies = allStudents.filter(s => s.academic_risk_level === "High" || s.academic_risk_level === "Medium").length;
             const job = allStudents.filter(s => s.placement_risk_level === "High" || s.placement_risk_level === "Medium").length;
 
@@ -1147,7 +1498,7 @@ async function renderRiskExplorerScreen() {
             renderPaginatedRows();
 
         } catch (err) {
-            tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--status-urgent); padding: 20px;">${err.message}</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--status-urgent); padding: 20px;">${escapeHtml(err.message)}</td></tr>`;
         }
     }
 
@@ -1171,23 +1522,22 @@ async function renderRiskExplorerScreen() {
         document.getElementById("risk-btn-next").disabled = currentPage >= totalPages;
 
         tbody.innerHTML = pageItems.map(s => {
-            const overallLevel = (s.academic_risk_level === "High" || s.placement_risk_level === "High") ? "High" : ((s.academic_risk_level === "Medium" || s.placement_risk_level === "Medium") ? "Medium" : "Low");
-            const badge = getAttentionBadgeHtml(overallLevel);
+            const badge = getAttentionBadgeHtml(s.overall_risk_level);
 
             const acadReason = s.academic_risk_reasons && s.academic_risk_reasons.length > 0 ? s.academic_risk_reasons[0] : "Doing fine in classes";
             const placeReason = s.placement_risk_reasons && s.placement_risk_reasons.length > 0 ? s.placement_risk_reasons[0] : "Doing fine with job prep";
 
             return `
                 <tr>
-                    <td><span class="mono-num" style="font-weight: 600;">${s.student_id}</span></td>
-                    <td><strong>${s.name}</strong></td>
-                    <td>${s.department} · Year ${s.year}</td>
+                    <td><span class="mono-num" style="font-weight: 600;">${escapeHtml(s.student_id)}</span></td>
+                    <td><strong>${escapeHtml(s.name)}</strong></td>
+                    <td>${escapeHtml(s.department)} · Year ${s.year}</td>
                     <td class="num-col mono-num" style="font-weight: 700;">${formatScore(s.total_success_score)}</td>
                     <td>${badge}</td>
                     <td class="truncate-cell" title="${escapeHtml(acadReason)}">${escapeHtml(acadReason)}</td>
                     <td class="truncate-cell" title="${escapeHtml(placeReason)}">${escapeHtml(placeReason)}</td>
                     <td style="text-align: center;">
-                        <button class="btn-outline btn-inspect-student" data-sid="${s.student_id}" style="padding: 4px 10px; font-size: 12px;">View profile</button>
+                        <button class="btn-outline btn-inspect-student" data-sid="${escapeHtml(s.student_id)}" style="padding: 4px 10px; font-size: 12px;">View profile</button>
                     </td>
                 </tr>
             `;
@@ -1356,7 +1706,7 @@ async function renderActionListScreen() {
             renderActionCards();
 
         } catch (err) {
-            cardsContainer.innerHTML = `<div style="text-align: center; color: var(--status-urgent); padding: 20px;">${err.message}</div>`;
+            cardsContainer.innerHTML = `<div style="text-align: center; color: var(--status-urgent); padding: 20px;">${escapeHtml(err.message)}</div>`;
         }
     }
 
@@ -1389,14 +1739,14 @@ async function renderActionListScreen() {
                         <div class="action-rank-badge" title="Rank ${rank}">#${rank}</div>
                         <div style="flex: 1;">
                             <div style="display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px;">
-                                <strong style="font-size: 15px;">${a.student_name}</strong>
+                                <strong style="font-size: 15px;">${escapeHtml(a.student_name)}</strong>
                                 ${a.score_change !== null && a.score_change !== undefined ? `<span style="color: var(--status-fine); font-size: 12px; font-weight: 600;">${a.score_change >= 0 ? '+' : ''}${a.score_change.toFixed(1)} pts</span>` : ''}
-                                <span class="mono-num" style="font-size: 12px; color: var(--text-secondary); cursor: pointer; text-decoration: underline;" class="link-student-profile" data-sid="${a.student_id}">
-                                    ${a.student_id} (${a.department || 'Engineering'})
+                                <span class="mono-num" style="font-size: 12px; color: var(--text-secondary); cursor: pointer; text-decoration: underline;" class="link-student-profile" data-sid="${escapeHtml(a.student_id)}">
+                                    ${escapeHtml(a.student_id)} (${escapeHtml(a.department || 'Engineering')})
                                 </span>
                             </div>
                             <div style="font-size: 13px; color: var(--text-primary); margin-bottom: 4px;">
-                                <strong>${plainType.toUpperCase()}:</strong> ${a.description}
+                                <strong>${escapeHtml(plainType.toUpperCase())}:</strong> ${escapeHtml(a.description)}
                             </div>
                             <div style="font-size: 12px; color: var(--text-secondary); display: flex; gap: 14px;">
                                 <span>${LABELS.scoreCanImproveBy}: <strong class="mono-num" style="color: var(--status-fine);">+${a.potential_gain || 5} pts</strong></span>
@@ -1502,7 +1852,7 @@ async function renderStudentProfileScreen(studentId = null) {
                 return;
             }
         } catch (err) {
-            container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${err.message}</p></div>`;
+            container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${escapeHtml(err.message)}</p></div>`;
             return;
         }
     }
@@ -1526,8 +1876,8 @@ async function renderStudentProfileScreen(studentId = null) {
         container.innerHTML = `
             <div class="page-header">
                 <div>
-                    <h1 class="page-title">${student.name} <span class="mono-num" style="font-size: 18px; color: var(--text-muted); font-weight: normal;">(${student.student_id})</span></h1>
-                    <div class="page-purpose">${student.department} Engineering · Year ${student.year} · Semester ${student.semester} · Teacher: ${student.mentor ? student.mentor.name : 'Faculty Advisor'}</div>
+                    <h1 class="page-title">${escapeHtml(student.name)} <span class="mono-num" style="font-size: 18px; color: var(--text-muted); font-weight: normal;">(${escapeHtml(student.student_id)})</span></h1>
+                    <div class="page-purpose">${escapeHtml(student.department)} Engineering · Year ${student.year} · Semester ${student.semester} · Teacher: ${escapeHtml(student.mentor ? student.mentor.name : 'Faculty Advisor')}</div>
                 </div>
                 <div>
                     <button class="btn-outline" id="btn-back-to-list">&larr; Back to Student List</button>
@@ -1647,8 +1997,8 @@ async function renderStudentProfileScreen(studentId = null) {
                             <tbody>
                                 ${(student.subject_records || []).map(sub => `
                                     <tr>
-                                        <td><span class="mono-num" style="font-weight: 600;">${sub.subject_code}</span></td>
-                                        <td>${sub.subject_name}</td>
+                                        <td><span class="mono-num" style="font-weight: 600;">${escapeHtml(sub.subject_code)}</span></td>
+                                        <td>${escapeHtml(sub.subject_name)}</td>
                                         <td class="num-col mono-num">${formatScore(sub.marks)} / 100</td>
                                         <td class="num-col mono-num">${formatPercent(sub.attendance_pct)}</td>
                                         <td>
@@ -1672,6 +2022,56 @@ async function renderStudentProfileScreen(studentId = null) {
                         <canvas id="chart-student-history"></canvas>
                     </div>
                 </div>
+            </div>
+
+            <div class="content-card activity-history-card">
+                <div class="card-header">
+                    <div class="card-title-row">
+                        <h2 class="card-title">Progress and Support History</h2>
+                    </div>
+                    <div class="card-how-to-read">History includes timestamped advisor support and mentor-message records. Semester and course records do not include event dates.</div>
+                </div>
+                <div class="activity-summary">
+                    <div><strong>Last recorded activity:</strong>
+                        ${student.last_activity_at
+                            ? `${escapeHtml(new Date(student.last_activity_at).toLocaleString())} (${student.days_since_last_activity} days ago)`
+                            : "Unavailable"}
+                    </div>
+                    <div><strong>Last record updated:</strong>
+                        ${student.last_record_updated
+                            ? escapeHtml(new Date(student.last_record_updated).toLocaleString())
+                            : "Unavailable"}
+                    </div>
+                </div>
+                ${(student.semester_history || []).length ? `
+                    <h3 class="activity-subheading">Semester progress (semester dates were not recorded)</h3>
+                    <div class="table-responsive">
+                        <table class="dense-table">
+                            <thead><tr><th>Semester</th><th class="num-col">GPA</th><th class="num-col">Attendance</th><th class="num-col">Credits</th><th class="num-col">Backlogs</th></tr></thead>
+                            <tbody>${student.semester_history.map(item => `
+                                <tr>
+                                    <td>Semester ${item.semester}</td>
+                                    <td class="num-col mono-num">${formatGpa(item.gpa)}</td>
+                                    <td class="num-col mono-num">${formatPercent(item.attendance_pct)}</td>
+                                    <td class="num-col mono-num">${formatCount(item.credits_earned)}</td>
+                                    <td class="num-col mono-num">${formatCount(item.backlogs)}</td>
+                                </tr>
+                            `).join("")}</tbody>
+                        </table>
+                    </div>
+                ` : ""}
+                ${student.activity_history?.length ? `
+                    <ol class="activity-timeline">
+                        ${student.activity_history.slice().reverse().map(item => `
+                            <li class="activity-timeline-item">
+                                <time datetime="${escapeHtml(item.date)}">${escapeHtml(new Date(item.date).toLocaleString())}</time>
+                                <strong>${escapeHtml(item.type)}</strong>
+                                <span class="status-badge status-soon">${escapeHtml(item.status.replaceAll("_", " "))}</span>
+                                <p>${escapeHtml(item.details)}</p>
+                            </li>
+                        `).join("")}
+                    </ol>
+                ` : `<p class="help-text-grey activity-empty">Activity history unavailable: no timestamped support or mentor-message records exist.</p>`}
             </div>
 
             <!-- Try a Change Sliders Panel (PART 3) -->
@@ -1884,7 +2284,7 @@ async function renderStudentProfileScreen(studentId = null) {
         updateWhatIf();
 
     } catch (err) {
-        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${err.message}</p></div>`;
+        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${escapeHtml(err.message)}</p></div>`;
     }
 }
 
@@ -1982,11 +2382,11 @@ async function renderSegmentsScreen() {
                 ${ruleMapped.map(g => `
                     <div class="col-6 content-card">
                         <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px;">
-                            <h3 style="font-size: 16px; font-weight: 600; color: var(--accent-teal);">${g.displayName}</h3>
+                            <h3 style="font-size: 16px; font-weight: 600; color: var(--accent-teal);">${escapeHtml(g.displayName)}</h3>
                             <span class="mono-num" style="font-size: 14px; font-weight: 700;">${g.count} students (${g.percentage}%)</span>
                         </div>
                         <p style="font-size: 13.5px; color: var(--text-secondary); line-height: 1.45;">
-                            ${g.description}
+                            ${escapeHtml(g.description)}
                         </p>
                     </div>
                 `).join('')}
@@ -2033,7 +2433,7 @@ async function renderSegmentsScreen() {
         activeCharts.push(chart);
 
     } catch (err) {
-        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${err.message}</p></div>`;
+        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${escapeHtml(err.message)}</p></div>`;
     }
 }
 
@@ -2074,9 +2474,9 @@ async function renderInsightsScreen() {
                     const plainCat = f.category.replace("Intervention Alert", "Support Alert").replace("Academic Risk Driver", "Studies Driver");
                     return `
                         <div class="col-4 content-card" style="border-left: 3px solid var(--accent-teal);">
-                            <div class="filter-label" style="color: var(--accent-teal); margin-bottom: 4px;">${plainCat}</div>
-                            <h3 style="font-size: 15px; margin-bottom: 6px;">${f.title}</h3>
-                            <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.45;">${f.description}</p>
+                            <div class="filter-label" style="color: var(--accent-teal); margin-bottom: 4px;">${escapeHtml(plainCat)}</div>
+                            <h3 style="font-size: 15px; margin-bottom: 6px;">${escapeHtml(f.title)}</h3>
+                            <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.45;">${escapeHtml(f.description)}</p>
                         </div>
                     `;
                 }).join('')}
@@ -2118,7 +2518,7 @@ async function renderInsightsScreen() {
                             <tbody>
                                 ${(data.department_satisfaction || []).map(d => `
                                     <tr>
-                                        <td><strong>${d.department}</strong></td>
+                                        <td><strong>${escapeHtml(d.department)}</strong></td>
                                         <td class="num-col mono-num" style="font-weight: 700;">${formatScore(d.avg_satisfaction)} / 100</td>
                                         <td>${d.avg_satisfaction >= 75 ? getAttentionBadgeHtml("low") : getAttentionBadgeHtml("medium")}</td>
                                     </tr>
@@ -2184,7 +2584,7 @@ async function renderInsightsScreen() {
 
             try {
                 const res = await askCampusAI(q);
-                respBox.innerHTML = `<strong>Campus Answer:</strong><p style="margin-top: 4px;">${res.answer}</p>`;
+                respBox.innerHTML = `<strong>Campus Answer:</strong><p style="margin-top: 4px;">${escapeHtml(res.answer)}</p>`;
             } catch (err) {
                 respBox.textContent = "Error finding answer: " + err.message;
             } finally {
@@ -2194,13 +2594,59 @@ async function renderInsightsScreen() {
         });
 
     } catch (err) {
-        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${err.message}</p></div>`;
+        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${escapeHtml(err.message)}</p></div>`;
     }
 }
 
 /* ==========================================================================
    SCREEN 8: UPLOAD DATA & RECORDS (DATA QUALITY - ADMIN ONLY)
    ========================================================================== */
+async function renderStudentAccountRequestsScreen() {
+    const container = document.getElementById("screen-container");
+    try {
+        const result = await getStudentAccountRequests();
+        const requests = result.requests || [];
+        container.innerHTML = `
+            <div class="page-header">
+                <div>
+                    <h1 class="page-title">Student Account Requests</h1>
+                    <div class="page-purpose">Review student-only account requests before access is granted.</div>
+                </div>
+            </div>
+            <div class="content-card">
+                ${requests.length ? requests.map(request => `
+                    <div class="account-request-row" data-request-id="${request.id}">
+                        <div>
+                            <strong>${escapeHtml(request.student_name)}</strong>
+                            <div class="help-text-grey">${escapeHtml(request.student_id)} · ${escapeHtml(request.department)}</div>
+                            <div class="help-text-grey">Requested ${escapeHtml(new Date(request.created_at).toLocaleString())}</div>
+                        </div>
+                        <div class="account-request-actions">
+                            <button class="btn-primary" type="button" data-decision="approve">Approve</button>
+                            <button class="btn-outline" type="button" data-decision="reject">Reject</button>
+                        </div>
+                    </div>
+                `).join("") : `<p class="help-text-grey">There are no pending student account requests.</p>`}
+            </div>
+        `;
+        container.querySelectorAll(".account-request-row button").forEach(button => {
+            button.addEventListener("click", async () => {
+                const row = button.closest(".account-request-row");
+                row.querySelectorAll("button").forEach(item => { item.disabled = true; });
+                try {
+                    await reviewStudentAccountRequest(row.dataset.requestId, button.dataset.decision);
+                    await renderStudentAccountRequestsScreen();
+                } catch (error) {
+                    row.querySelectorAll("button").forEach(item => { item.disabled = false; });
+                    alert(`Could not ${button.dataset.decision} request: ${error.message}`);
+                }
+            });
+        });
+    } catch (error) {
+        container.innerHTML = `<div class="state-container"><p>${escapeHtml(error.message)}</p></div>`;
+    }
+}
+
 async function renderDataQualityScreen() {
     const container = document.getElementById("screen-container");
     try {
@@ -2254,10 +2700,17 @@ async function renderDataQualityScreen() {
                         <div class="card-title-row">
                             <h2 class="card-title">Upload Campus CSV Files ${helpTip("Upload one or more files. Existing students will update safely without creating duplicates.")}</h2>
                         </div>
-                        <div class="card-how-to-read">How to read this: Choose any combination of files below. Safe to re-upload anytime.</div>
+                        <div class="card-how-to-read">Partial updates change only supplied sources. Full imports require all seven files and update only students included in the upload.</div>
                     </div>
                     <form id="form-csv-upload" enctype="multipart/form-data">
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px;">
+                            <div style="margin-bottom: 14px;">
+                                <label for="csv-import-mode" style="font-size: 12px; font-weight: 600;">Import mode</label>
+                                <select id="csv-import-mode" class="form-control">
+                                    <option value="partial">Partial update (uploaded sources only)</option>
+                                    <option value="full">Full import (all seven source files)</option>
+                                </select>
+                            </div>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px;">
                             <div>
                                 <label style="font-size: 12px; font-weight: 600;">1. Academics CSV</label>
                                 <input type="file" id="file-academic" name="academic" accept=".csv" class="form-control" style="font-size: 12px; padding: 5px;">
@@ -2338,20 +2791,20 @@ async function renderDataQualityScreen() {
                         <tbody>
                             ${(qualityData.recent_logs || []).slice(0, 15).map(l => {
                                 const plainIssue = l.issue_type
-                                    .replace("missing_value", "Missing value filled in")
+                                    .replace("missing_value", "Blank value left unchanged")
                                     .replace("duplicate_id", "Duplicate ID resolved")
                                     .replace("spelling_normalization", "Spelling normalized")
                                     .replace("out_of_range", "Out-of-range value fixed")
                                     .replace("id_normalization", "ID formatted");
                                 return `
                                     <tr>
-                                        <td><strong>${l.source_file}</strong></td>
-                                        <td><span class="mono-num">${l.student_id || '-'}</span></td>
-                                        <td><code>${l.field_name}</code></td>
-                                        <td><span class="status-badge status-soon"><span class="status-dot dot-soon"></span>${plainIssue}</span></td>
+                                        <td><strong>${escapeHtml(l.source_file)}</strong></td>
+                                        <td><span class="mono-num">${escapeHtml(l.student_id || '-')}</span></td>
+                                        <td><code>${escapeHtml(l.field_name)}</code></td>
+                                        <td><span class="status-badge status-soon"><span class="status-dot dot-soon"></span>${escapeHtml(plainIssue)}</span></td>
                                         <td class="mono-num" style="color: var(--status-urgent);">${escapeHtml(l.original_value || '')}</td>
                                         <td class="mono-num" style="color: var(--status-fine); font-weight: 600;">${escapeHtml(l.cleaned_value || '')}</td>
-                                        <td style="font-size: 12px;">${l.rule_applied}</td>
+                                        <td style="font-size: 12px;">${escapeHtml(l.rule_applied)}</td>
                                     </tr>
                                 `;
                             }).join('')}
@@ -2369,6 +2822,7 @@ async function renderDataQualityScreen() {
         uploadForm.addEventListener("submit", async (e) => {
             e.preventDefault();
             const formData = new FormData();
+            formData.append("import_mode", document.getElementById("csv-import-mode").value);
             const fileInputs = [
                 "academic", "attendance", "lms", "engagement",
                 "placement", "skills", "feedback"
@@ -2392,9 +2846,14 @@ async function renderDataQualityScreen() {
             statusMsg.style.color = "var(--accent-teal)";
 
             try {
-                await uploadCsvFiles(formData);
+                const result = await uploadCsvFiles(formData);
+                const summary = result.ingestion_summary;
+                const ignoredColumns = summary.not_persisted_columns || [];
+                const ignoredNote = ignoredColumns.length
+                    ? ` Validated but not stored: ${ignoredColumns.join(", ")}.`
+                    : "";
                 statusMsg.style.color = "var(--status-fine)";
-                statusMsg.textContent = "Upload successful! All student records have been updated.";
+                statusMsg.textContent = `Upload successful (${summary.import_mode}). Accepted: ${summary.accepted_rows}; rejected: ${summary.rejected_rows}; duplicates: ${summary.duplicate_rows}; updated: ${summary.updated_rows}.${ignoredNote}`;
                 setTimeout(() => renderDataQualityScreen(), 1500);
             } catch (err) {
                 statusMsg.style.color = "var(--status-urgent)";
@@ -2403,7 +2862,7 @@ async function renderDataQualityScreen() {
         });
 
     } catch (err) {
-        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${err.message}</p></div>`;
+        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${escapeHtml(err.message)}</p></div>`;
     }
 }
 
@@ -2418,7 +2877,24 @@ async function renderModelSettingsScreen() {
             getModelMetrics()
         ]);
 
-        const accuracyPct = Math.round((mlMetrics.accuracy || 0) * 100);
+        const isModelTrained = mlMetrics.status === "trained";
+        const metricPercent = value => Number.isFinite(value)
+            ? `${Math.round(value * 100)}%`
+            : "N/A";
+        const accuracyPct = isModelTrained ? metricPercent(mlMetrics.accuracy) : "N/A";
+        const accuracyWidth = isModelTrained && Number.isFinite(mlMetrics.accuracy)
+            ? Math.max(0, Math.min(100, mlMetrics.accuracy * 100))
+            : 0;
+        const testCounts = mlMetrics.test_class_counts || { negative: 0, positive: 0 };
+        const trainingCounts = mlMetrics.training_class_counts || { negative: 0, positive: 0 };
+        const safeCount = value => Number.isInteger(value) && value >= 0 ? value : "N/A";
+        const matrix = mlMetrics.model_metrics?.confusion_matrix;
+        const confusionText = Array.isArray(matrix)
+            && matrix.length === 2
+            && matrix.every(row => Array.isArray(row) && row.length === 2
+                && row.every(value => Number.isInteger(value) && value >= 0))
+            ? `Actual rows / predicted columns [no-event, event]: [${matrix[0].join(", ")}] / [${matrix[1].join(", ")}]`
+            : "N/A";
 
         container.innerHTML = `
             <div class="page-header">
@@ -2437,7 +2913,7 @@ async function renderModelSettingsScreen() {
                     <div class="summary-card-header">
                         <span class="summary-label">Test Accuracy</span>
                     </div>
-                    <div class="summary-value mono-num" style="color: var(--status-fine);">${accuracyPct}%</div>
+                    <div class="summary-value mono-num">${accuracyPct}</div>
                     <div class="summary-change-row">
                         <span class="change-text">Held-out semesters 6→7 and 7→8</span>
                     </div>
@@ -2447,7 +2923,7 @@ async function renderModelSettingsScreen() {
                     <div class="summary-card-header">
                         <span class="summary-label">Test Precision</span>
                     </div>
-                    <div class="summary-value mono-num">${Math.round((mlMetrics.cv_precision || 0.85) * 100)}%</div>
+                    <div class="summary-value mono-num">${isModelTrained ? metricPercent(mlMetrics.precision) : "N/A"}</div>
                     <div class="summary-change-row">
                         <span class="change-text">Next-semester predictions</span>
                     </div>
@@ -2457,7 +2933,7 @@ async function renderModelSettingsScreen() {
                     <div class="summary-card-header">
                         <span class="summary-label">Test ROC-AUC</span>
                     </div>
-                    <div class="summary-value mono-num">${Math.round((mlMetrics.cv_roc_auc || 0.91) * 100)}%</div>
+                    <div class="summary-value mono-num">${isModelTrained ? metricPercent(mlMetrics.roc_auc) : "N/A"}</div>
                     <div class="summary-change-row">
                         <span class="change-text">Time-based evaluation</span>
                     </div>
@@ -2474,20 +2950,23 @@ async function renderModelSettingsScreen() {
                         <div class="card-how-to-read">Measured only on held-out semester 6→7 and 7→8 transitions.</div>
                     </div>
                     <div class="card-takeaway">
-                        The model correctly predicts next-semester outcomes in <strong>${accuracyPct} out of 100</strong> held-out transitions.
+                        Target: ${escapeHtml(mlMetrics.target_definition || "GPA drop or backlog increase in the following semester.")}<br>
+                        Training classes: ${safeCount(trainingCounts.positive)} positive / ${safeCount(trainingCounts.negative)} negative.
+                        Held-out classes: ${safeCount(testCounts.positive)} positive / ${safeCount(testCounts.negative)} negative.<br>
+                        Confusion matrix (actual rows / predicted columns): ${confusionText}
                     </div>
 
                     <div style="margin: 20px 0;">
                         <div style="display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; margin-bottom: 6px;">
                             <span>Next-semester prediction accuracy</span>
-                            <span class="mono-num">${accuracyPct}%</span>
+                            <span class="mono-num">${accuracyPct}</span>
                         </div>
                         <div class="influence-track" style="height: 18px;">
-                            <div class="influence-fill-help" style="width: ${accuracyPct}%;"></div>
+                            <div class="influence-fill-help" style="width: ${accuracyWidth}%;"></div>
                         </div>
                     </div>
                     <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.5;">
-                        ${mlMetrics.honest_note || "The model uses a time-based train/test split on semester history."}
+                        ${escapeHtml(mlMetrics.honest_note || "No validated model evaluation is available.")}
                     </p>
                 </div>
 
@@ -2495,19 +2974,19 @@ async function renderModelSettingsScreen() {
                 <div class="col-6 content-card">
                     <div class="card-header">
                         <div class="card-title-row">
-                            <h2 class="card-title">Features used for prediction</h2>
+                            <h2 class="card-title">Model feature importance</h2>
                         </div>
-                        <div class="card-how-to-read">Importance of each semester-history feature in the fitted model.</div>
+                        <div class="card-how-to-read">${escapeHtml(mlMetrics.feature_importance_note || "Importance is not causal and does not explain an individual prediction.")}</div>
                     </div>
                     <div style="display: flex; flex-direction: column; gap: 10px;">
                         ${(mlMetrics.feature_importances || []).slice(0, 5).map(f => `
                             <div>
                                 <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 3px;">
-                                    <strong>${f.feature}</strong>
-                                    <span class="mono-num">${Math.round(f.percentage)}%</span>
+                                    <strong>${escapeHtml(f.feature)}</strong>
+                                    <span class="mono-num">${Number.isFinite(f.percentage) ? Math.round(f.percentage) : 0}%</span>
                                 </div>
                                 <div class="influence-track" style="height: 8px;">
-                                    <div class="influence-fill-help" style="width: ${f.percentage}%; background-color: var(--accent-teal);"></div>
+                                    <div class="influence-fill-help" style="width: ${Number.isFinite(f.percentage) ? Math.max(0, Math.min(100, f.percentage)) : 0}%; background-color: var(--accent-teal);"></div>
                                 </div>
                             </div>
                         `).join('')}
@@ -2530,11 +3009,11 @@ async function renderModelSettingsScreen() {
                             ].map(([name, values]) => `
                                 <tr>
                                     <td>${name}</td>
-                                    <td>${Math.round((values?.accuracy || 0) * 100)}%</td>
-                                    <td>${Math.round((values?.precision || 0) * 100)}%</td>
-                                    <td>${Math.round((values?.recall || 0) * 100)}%</td>
-                                    <td>${Math.round((values?.f1 || 0) * 100)}%</td>
-                                    <td>${Math.round((values?.roc_auc || 0) * 100)}%</td>
+                                    <td>${metricPercent(values?.accuracy)}</td>
+                                    <td>${metricPercent(values?.precision)}</td>
+                                    <td>${metricPercent(values?.recall)}</td>
+                                    <td>${metricPercent(values?.f1)}</td>
+                                    <td>${metricPercent(values?.roc_auc)}</td>
                                 </tr>
                             `).join("")}
                         </tbody>
@@ -2659,7 +3138,7 @@ async function renderModelSettingsScreen() {
         });
 
     } catch (err) {
-        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${err.message}</p></div>`;
+        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${escapeHtml(err.message)}</p></div>`;
     }
 }
 
@@ -2807,8 +3286,8 @@ async function renderStudentPortalScreen(studentId, subTab = "progress") {
             container.innerHTML = `
                 <div class="page-header">
                     <div>
-                        <h1 class="page-title">Welcome, ${student.name}</h1>
-                        <div class="page-purpose">${student.department} Engineering · Year ${student.year} · Roll Number: ${student.student_id} · Advisor: ${student.mentor ? student.mentor.name : 'Department Advisor'}</div>
+                        <h1 class="page-title">Welcome, ${escapeHtml(student.name)}</h1>
+                        <div class="page-purpose">${escapeHtml(student.department)} Engineering · Year ${student.year} · Roll Number: ${escapeHtml(student.student_id)} · Advisor: ${escapeHtml(student.mentor ? student.mentor.name : 'Department Advisor')}</div>
                     </div>
                 </div>
 
@@ -2821,7 +3300,7 @@ async function renderStudentPortalScreen(studentId, subTab = "progress") {
                             ${formatScore(student.total_success_score)}
                         </div>
                         <div style="font-size: 13px; color: var(--text-secondary); margin-top: 4px;">
-                            ${LABELS.collegeAverage}: <strong class="mono-num">${formatScore(student.cohort_averages.total_success_score)}</strong> ${LABELS.scoreOutScores}
+                            Your personal progress score
                         </div>
                     </div>
 
@@ -2838,7 +3317,7 @@ async function renderStudentPortalScreen(studentId, subTab = "progress") {
                                 <div class="filter-label" style="color: var(--status-fine); margin-bottom: 8px;">What you are doing well</div>
                                 ${(student.strengths || []).map(s => `
                                     <div style="background-color: var(--status-fine-bg); border-left: 3px solid var(--status-fine); padding: 8px 12px; margin-bottom: 8px; font-size: 13px;">
-                                        &check; ${s}
+                                        &check; ${escapeHtml(s)}
                                     </div>
                                 `).join('')}
                             </div>
@@ -2846,7 +3325,7 @@ async function renderStudentPortalScreen(studentId, subTab = "progress") {
                                 <div class="filter-label" style="color: var(--accent-teal); margin-bottom: 8px;">Focus areas to improve</div>
                                 ${(student.focus_areas || []).map(f => `
                                     <div style="background-color: var(--accent-teal-subtle); border-left: 3px solid var(--accent-teal); padding: 8px 12px; margin-bottom: 8px; font-size: 13px;">
-                                        &rarr; ${f}
+                                        &rarr; ${escapeHtml(f)}
                                     </div>
                                 `).join('')}
                             </div>
@@ -2875,8 +3354,8 @@ async function renderStudentPortalScreen(studentId, subTab = "progress") {
                                 <tbody>
                                     ${(student.subject_records || []).map(sub => `
                                         <tr>
-                                            <td><span class="mono-num" style="font-weight: 600;">${sub.subject_code}</span></td>
-                                            <td>${sub.subject_name}</td>
+                                            <td><span class="mono-num" style="font-weight: 600;">${escapeHtml(sub.subject_code)}</span></td>
+                                            <td>${escapeHtml(sub.subject_name)}</td>
                                             <td class="num-col mono-num">${formatScore(sub.marks)} / 100</td>
                                             <td class="num-col mono-num">${formatPercent(sub.attendance_pct)}</td>
                                         </tr>
@@ -3086,7 +3565,7 @@ async function renderStudentPortalScreen(studentId, subTab = "progress") {
                                 ${actions.length === 0 ? `<tr><td colspan="4" style="text-align: center; padding: 24px; color: var(--text-muted);">No assigned next steps at this time. Keep up the great work!</td></tr>` : actions.map(a => `
                                     <tr data-action-id="${a.id}">
                                         <td><strong>${a.action_type.replace(/_/g, ' ').toUpperCase()}</strong></td>
-                                        <td>${a.description}</td>
+                                        <td>${escapeHtml(a.description)}</td>
                                         <td>
                                             ${a.status === 'done' ? `<span class="status-badge status-fine"><span class="status-dot dot-fine"></span>Completed</span>` : (a.status === 'in_progress' ? `<span class="status-badge status-soon"><span class="status-dot dot-soon"></span>In Progress</span>` : `<span class="status-badge status-soon"><span class="status-dot dot-soon"></span>Not Started</span>`)}
                                         </td>
@@ -3125,7 +3604,7 @@ async function renderStudentPortalScreen(studentId, subTab = "progress") {
                 <div class="page-header">
                     <div>
                         <h1 class="page-title">Ask My Mentor</h1>
-                        <div class="page-purpose">Direct line to your faculty advisor: ${student.mentor ? student.mentor.name : 'Faculty Advisor'}.</div>
+                        <div class="page-purpose">Direct line to your faculty advisor: ${escapeHtml(student.mentor ? student.mentor.name : 'Faculty Advisor')}.</div>
                     </div>
                 </div>
 
@@ -3157,13 +3636,13 @@ async function renderStudentPortalScreen(studentId, subTab = "progress") {
                             ${msgs.length === 0 ? `<p style="color: var(--text-muted); font-size: 13px;">No previous messages sent yet.</p>` : msgs.map(m => `
                                 <div style="padding: 12px; background-color: var(--bg-surface-subtle); border: 1px solid var(--border-hairline); border-radius: var(--radius-sm);">
                                     <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">
-                                        <span>Sent: ${m.created_at ? m.created_at.split('T')[0] : ''}</span>
+                                        <span>Sent: ${escapeHtml(m.created_at ? m.created_at.split('T')[0] : '')}</span>
                                         <span>${m.status === 'resolved' ? getAttentionBadgeHtml("low") : getAttentionBadgeHtml("medium")}</span>
                                     </div>
-                                    <div style="font-size: 13.5px; font-weight: 500; margin-bottom: 6px;">"${m.message}"</div>
+                                    <div style="font-size: 13.5px; font-weight: 500; margin-bottom: 6px;">"${escapeHtml(m.message)}"</div>
                                     ${m.reply ? `
                                         <div style="padding: 8px 10px; background-color: var(--accent-teal-subtle); border-left: 2px solid var(--accent-teal); font-size: 13px; margin-top: 6px;">
-                                            <strong>Advisor Reply:</strong> ${m.reply}
+                                            <strong>Advisor Reply:</strong> ${escapeHtml(m.reply)}
                                         </div>
                                     ` : `<div style="font-size: 12px; color: var(--text-muted); font-style: italic;">Awaiting advisor response</div>`}
                                 </div>
@@ -3195,7 +3674,7 @@ async function renderStudentPortalScreen(studentId, subTab = "progress") {
         document.getElementById("tab-student-guide")?.addEventListener("click", () => renderScoreGuideScreen());
 
     } catch (err) {
-        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${err.message}</p></div>`;
+        container.innerHTML = `<div class="state-container"><p style="color: var(--status-urgent);">${escapeHtml(err.message)}</p></div>`;
     }
 }
 
@@ -3223,10 +3702,4 @@ function debounce(fn, ms) {
         clearTimeout(timer);
         timer = setTimeout(() => fn.apply(this, args), ms);
     };
-}
-
-function escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = text || "";
-    return div.innerHTML;
 }

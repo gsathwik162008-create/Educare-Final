@@ -20,6 +20,24 @@ class User(Base):
     assignments = relationship("FacultyAssignment", back_populates="faculty", cascade="all, delete-orphan")
 
 
+class StudentAccountRequest(Base):
+    __tablename__ = "student_account_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String(50), ForeignKey("students.student_id"), nullable=False, unique=True, index=True)
+    hashed_password = Column(String(255), nullable=False)
+    status = Column(String(20), nullable=False, default="pending")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    reviewed_at = Column(DateTime, nullable=True)
+
+
+class RevokedToken(Base):
+    __tablename__ = "revoked_tokens"
+
+    jti = Column(String(64), primary_key=True)
+    expires_at = Column(DateTime, nullable=False)
+
+
 class Student(Base):
     __tablename__ = "students"
 
@@ -121,7 +139,7 @@ class StudentScore(Base):
     academic_risk_reasons = Column(Text, default="[]")  # JSON encoded list of strings
     placement_risk_level = Column(String(20), default="Low")  # Low, Medium, High
     placement_risk_reasons = Column(Text, default="[]")  # JSON encoded list of strings
-    ml_risk_probability = Column(Float, default=0.0)
+    ml_risk_probability = Column(Float, nullable=True, default=None)
     segment_rule = Column(String(100), default="Unassigned")
     segment_kmeans = Column(String(100), default="Cluster 0")
     score_explanation = Column(Text, default="")

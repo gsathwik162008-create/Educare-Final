@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
+from uuid import uuid4
 import jwt
 import bcrypt
 from fastapi import Depends, HTTPException, status
@@ -9,7 +10,7 @@ from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
 from app.database import get_db
-from app.models import User, FacultyAssignment, Student
+from app.models import User, FacultyAssignment, RevokedToken, Student
 
 load_dotenv()
 
@@ -43,7 +44,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     """Create a signed JWT token."""
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + (expires_delta if expires_delta else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "jti": uuid4().hex})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -87,6 +88,14 @@ def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token_id = payload.get("jti")
+    if not token_id or db.query(RevokedToken.jti).filter(RevokedToken.jti == token_id).first():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked token",
             headers={"WWW-Authenticate": "Bearer"},
         )
 

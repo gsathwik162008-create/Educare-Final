@@ -4,12 +4,14 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import case, or_
 
 from app.database import get_db
 from app.models import (
     User,
     Student,
+    InterventionAction,
+    StudentMentorMessage,
     UnifiedStudentMetrics,
     StudentScore,
     FacultyAssignment,
@@ -18,8 +20,16 @@ from app.models import (
     StudentMentorMessage
 )
 from app.auth import get_current_user, require_role, check_student_access
+from app.ml import get_model_metrics
+from app.risk import overall_risk_level
 
 router = APIRouter(prefix="/api/students", tags=["students"])
+
+
+def _current_ml_probability(score: Optional[StudentScore]) -> Optional[float]:
+    if score is None or get_model_metrics().get("status") != "trained":
+        return None
+    return score.ml_risk_probability
 
 
 class MessageCreate(BaseModel):
@@ -73,12 +83,24 @@ def list_students(
     if year and year != 0:
         query = query.filter(Student.year == year)
     if risk_level and risk_level != "All":
-        query = query.filter(
-            or_(
-                StudentScore.academic_risk_level == risk_level,
-                StudentScore.placement_risk_level == risk_level
-            )
+        overall_level = case(
+            (
+                or_(
+                    StudentScore.academic_risk_level == "High",
+                    StudentScore.placement_risk_level == "High"
+                ),
+                "High"
+            ),
+            (
+                or_(
+                    StudentScore.academic_risk_level == "Medium",
+                    StudentScore.placement_risk_level == "Medium"
+                ),
+                "Medium"
+            ),
+            else_="Low"
         )
+        query = query.filter(overall_level == risk_level)
     if segment and segment != "All":
         query = query.filter(
             or_(
@@ -118,7 +140,11 @@ def list_students(
             "academic_risk_reasons": json.loads(sc.academic_risk_reasons or "[]") if sc else [],
             "placement_risk_level": sc.placement_risk_level if sc else "Low",
             "placement_risk_reasons": json.loads(sc.placement_risk_reasons or "[]") if sc else [],
-            "ml_risk_probability": sc.ml_risk_probability if sc else 0.0,
+            "overall_risk_level": overall_risk_level(
+                sc.academic_risk_level if sc else "Low",
+                sc.placement_risk_level if sc else "Low"
+            ),
+            "ml_risk_probability": _current_ml_probability(sc),
             "segment_rule": sc.segment_rule if sc else "Unassigned",
             "segment_kmeans": sc.segment_kmeans if sc else "Unassigned",
         })
@@ -197,17 +223,6 @@ def get_student_profile(
     m = student.unified_metrics
     sc = student.score
 
-    # Compute cohort averages for comparison
-    all_scores = db.query(StudentScore).all()
-    cohort_avg = {
-        "total_success_score": round(sum(s.total_success_score for s in all_scores) / max(len(all_scores), 1), 1),
-        "academic_score": round(sum(s.academic_score for s in all_scores) / max(len(all_scores), 1), 1),
-        "attendance_score": round(sum(s.attendance_score for s in all_scores) / max(len(all_scores), 1), 1),
-        "placement_score": round(sum(s.placement_score for s in all_scores) / max(len(all_scores), 1), 1),
-        "lms_score": round(sum(s.lms_score for s in all_scores) / max(len(all_scores), 1), 1),
-        "skills_feedback_score": round(sum(s.skills_feedback_score for s in all_scores) / max(len(all_scores), 1), 1),
-    }
-
     # Semester history
     semesters = [
         {
@@ -253,7 +268,6 @@ def get_student_profile(
         "placement_score": sc.placement_score if sc else 0.0,
         "lms_score": sc.lms_score if sc else 0.0,
         "skills_feedback_score": sc.skills_feedback_score if sc else 0.0,
-        "cohort_averages": cohort_avg,
         "semester_history": semesters,
         "subject_records": subjects,
         "metrics": {
@@ -276,7 +290,7 @@ def get_student_profile(
         }
     }
 
-    # STUDENT VIEW: Warm, supportive phrasing, NEVER exposes risk labels, priority ranks, or segments!
+    # STUDENT VIEW: Supportive phrasing without staff-only risk assessments or segments.
     if current_user.role == "STUDENT":
         focus_areas = []
         strengths = []
@@ -307,14 +321,103 @@ def get_student_profile(
         return base_response
 
     # STAFF VIEW (ADMIN & FACULTY): Full analytical depth, risk flags, ML probabilities, segments
+    score_query = db.query(StudentScore)
+    if current_user.role == "FACULTY":
+        accessible_student_ids = db.query(Student.student_id).filter(
+            or_(
+                Student.mentor_id == current_user.id,
+                Student.student_id.in_(
+                    db.query(FacultyAssignment.student_id).filter(
+                        FacultyAssignment.faculty_id == current_user.id
+                    )
+                )
+            )
+        )
+        score_query = score_query.filter(StudentScore.student_id.in_(accessible_student_ids))
+    all_scores = score_query.all()
+    base_response["cohort_averages"] = {
+        "total_success_score": round(sum(s.total_success_score for s in all_scores) / max(len(all_scores), 1), 1),
+        "academic_score": round(sum(s.academic_score for s in all_scores) / max(len(all_scores), 1), 1),
+        "attendance_score": round(sum(s.attendance_score for s in all_scores) / max(len(all_scores), 1), 1),
+        "placement_score": round(sum(s.placement_score for s in all_scores) / max(len(all_scores), 1), 1),
+        "lms_score": round(sum(s.lms_score for s in all_scores) / max(len(all_scores), 1), 1),
+        "skills_feedback_score": round(sum(s.skills_feedback_score for s in all_scores) / max(len(all_scores), 1), 1),
+    }
     base_response["academic_risk_level"] = sc.academic_risk_level if sc else "Low"
     base_response["academic_risk_reasons"] = json.loads(sc.academic_risk_reasons or "[]") if sc else []
     base_response["placement_risk_level"] = sc.placement_risk_level if sc else "Low"
     base_response["placement_risk_reasons"] = json.loads(sc.placement_risk_reasons or "[]") if sc else []
-    base_response["ml_risk_probability"] = sc.ml_risk_probability if sc else 0.0
+    base_response["ml_risk_probability"] = _current_ml_probability(sc)
     base_response["segment_rule"] = sc.segment_rule if sc else "Unassigned"
     base_response["segment_kmeans"] = sc.segment_kmeans if sc else "Unassigned"
     base_response["score_explanation"] = sc.score_explanation if sc else ""
+    activity_history = []
+    for action in db.query(InterventionAction).filter(
+        InterventionAction.student_id == student.student_id
+    ).all():
+        action_details = action.description
+        if action.notes:
+            action_details = f"{action_details} — Notes: {action.notes}"
+        if action.created_at:
+            activity_history.append({
+                "date": action.created_at.isoformat(),
+                "type": "Advisor support assigned",
+                "status": "created",
+                "details": action_details,
+            })
+        if action.updated_at and action.updated_at != action.created_at:
+            activity_history.append({
+                "date": action.updated_at.isoformat(),
+                "type": "Advisor support updated",
+                "status": action.status,
+                "details": action_details,
+            })
+        if action.completed_at:
+            activity_history.append({
+                "date": action.completed_at.isoformat(),
+                "type": "Advisor support completed",
+                "status": "done",
+                "details": action.description,
+            })
+
+    for message in db.query(StudentMentorMessage).filter(
+        StudentMentorMessage.student_id == student.student_id
+    ).all():
+        if message.created_at:
+            activity_history.append({
+                "date": message.created_at.isoformat(),
+                "type": "Student message",
+                "status": message.status,
+                "details": message.message,
+            })
+        if (
+            message.reply
+            and message.updated_at
+            and message.created_at
+            and message.updated_at != message.created_at
+        ):
+            activity_history.append({
+                "date": message.updated_at.isoformat(),
+                "type": "Advisor reply",
+                "status": message.status,
+                "details": message.reply,
+            })
+
+    activity_history.sort(key=lambda item: item["date"])
+    last_activity_at = activity_history[-1]["date"] if activity_history else None
+    days_since_last_activity = None
+    if last_activity_at:
+        latest_activity = datetime.fromisoformat(last_activity_at)
+        if latest_activity.tzinfo is None:
+            latest_activity = latest_activity.replace(tzinfo=timezone.utc)
+        days_since_last_activity = max(
+            0,
+            (datetime.now(timezone.utc) - latest_activity).days,
+        )
+    base_response["activity_history"] = activity_history
+    base_response["last_activity_at"] = last_activity_at
+    base_response["days_since_last_activity"] = days_since_last_activity
+    base_response["last_record_updated"] = m.last_updated.isoformat() if m and m.last_updated else None
 
     return base_response
 
@@ -327,6 +430,9 @@ def send_mentor_message(
     db: Session = Depends(get_db)
 ):
     """Student submits a message/question to their mentor ("Ask my mentor")."""
+    if current_user.role != "STUDENT":
+        raise HTTPException(status_code=403, detail="Only students may send mentor messages")
+
     check_student_access(student_id, current_user, db)
 
     student = db.query(Student).filter(Student.student_id == student_id.strip().upper()).first()

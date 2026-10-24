@@ -32,7 +32,10 @@ from app.ml import (
 from app.interventions import refresh_interventions_for_all
 
 
-def run_full_analytics_pipeline(db: Session) -> Dict[str, Any]:
+def run_full_analytics_pipeline(
+    db: Session,
+    persist_model_cache: bool = True,
+) -> Dict[str, Any]:
     """
     Executes complete analytics pipeline:
     1. Reads score settings & metrics
@@ -58,7 +61,6 @@ def run_full_analytics_pipeline(db: Session) -> Dict[str, Any]:
             threshold_coding_score=40.0
         )
         db.add(settings)
-        db.commit()
 
     weights = {
         "academic_score": settings.weight_academic,
@@ -97,7 +99,10 @@ def run_full_analytics_pipeline(db: Session) -> Dict[str, Any]:
         history_by_student.setdefault(h.student_id, []).append(h)
 
     # 5. Train and use the time-based next-semester GPA-drop model
-    ml_metrics = train_gradient_boosting_model(sem_histories)
+    ml_metrics = train_gradient_boosting_model(
+        sem_histories,
+        persist=persist_model_cache,
+    )
 
     # 6. Compute K-Means clusters
     kmeans_clusters = compute_kmeans_segments(metrics_list)
@@ -174,7 +179,7 @@ def run_full_analytics_pipeline(db: Session) -> Dict[str, Any]:
         score_rec.score_explanation = explanation
         score_rec.updated_at = datetime.now(timezone.utc)
 
-    db.commit()
+    db.flush()
 
     # 9. Refresh and rank intervention actions
     created_interventions = refresh_interventions_for_all(db)

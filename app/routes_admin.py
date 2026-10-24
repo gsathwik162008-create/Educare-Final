@@ -2,19 +2,63 @@ import io
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from app.database import get_db
-from app.models import User, ScoreSettings, CleaningLog, Student, StudentScore
+from app.models import (
+    User,
+    ScoreSettings,
+    CleaningLog,
+    Student,
+    StudentAccountRequest,
+    StudentScore,
+)
 from app.auth import get_current_user, require_role
 from app.ingestion import ingest_seven_sources, CSV_TEMPLATES
 from app.analytics_pipeline import run_full_analytics_pipeline
+from app import ml
 from app.ml import get_model_metrics
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+MAX_CSV_FILE_BYTES = 8 * 1024 * 1024
+MAX_CSV_REQUEST_BYTES = 20 * 1024 * 1024
+
+
+async def _read_upload_limited(upload: UploadFile, remaining_bytes: int) -> bytes:
+    content = bytearray()
+    while True:
+        chunk = await upload.read(min(64 * 1024, remaining_bytes - len(content) + 1))
+        if not chunk:
+            return bytes(content)
+        content.extend(chunk)
+        if len(content) > min(MAX_CSV_FILE_BYTES, remaining_bytes):
+            raise HTTPException(
+                status_code=413,
+                detail="CSV uploads are limited to 8 MB per file and 20 MB per request.",
+            )
+
+
+def _run_pipeline_and_commit(db: Session) -> Dict[str, Any]:
+    previous_model_state = ml.snapshot_model_state()
+    try:
+        result = run_full_analytics_pipeline(db, persist_model_cache=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        ml.restore_model_state(previous_model_state)
+        raise
+
+    try:
+        ml.persist_trained_model()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Analytics were saved, but the model cache could not be updated.",
+        ) from exc
+    return result
 
 
 class SettingsUpdate(BaseModel):
@@ -26,6 +70,83 @@ class SettingsUpdate(BaseModel):
     threshold_academic_cgpa: float = Field(..., ge=0, le=10)
     threshold_attendance_pct: float = Field(..., ge=0, le=100)
     threshold_coding_score: float = Field(..., ge=0, le=100)
+
+
+@router.get("/account-requests")
+def list_student_account_requests(
+    current_user: User = Depends(require_role(["ADMIN"])),
+    db: Session = Depends(get_db),
+):
+    requests = db.query(StudentAccountRequest).filter(
+        StudentAccountRequest.status == "pending"
+    ).order_by(StudentAccountRequest.created_at.asc()).all()
+    students = {
+        student.student_id: student
+        for student in db.query(Student).filter(
+            Student.student_id.in_([request.student_id for request in requests])
+        ).all()
+    }
+    return {
+        "requests": [
+            {
+                "id": request.id,
+                "student_id": request.student_id,
+                "student_name": students[request.student_id].name,
+                "department": students[request.student_id].department,
+                "created_at": request.created_at.isoformat() if request.created_at else None,
+            }
+            for request in requests
+            if request.student_id in students
+        ]
+    }
+
+
+@router.post("/account-requests/{request_id}/approve")
+def approve_student_account_request(
+    request_id: int,
+    current_user: User = Depends(require_role(["ADMIN"])),
+    db: Session = Depends(get_db),
+):
+    account_request = db.query(StudentAccountRequest).filter(
+        StudentAccountRequest.id == request_id,
+        StudentAccountRequest.status == "pending",
+    ).first()
+    if not account_request:
+        raise HTTPException(status_code=404, detail="Pending account request not found.")
+    if db.query(User.id).filter(
+        (User.username == account_request.student_id)
+        | (User.student_id == account_request.student_id)
+    ).first():
+        raise HTTPException(status_code=409, detail="An account already exists for this student.")
+
+    db.add(User(
+        username=account_request.student_id,
+        hashed_password=account_request.hashed_password,
+        role="STUDENT",
+        student_id=account_request.student_id,
+    ))
+    account_request.status = "approved"
+    account_request.reviewed_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "approved", "student_id": account_request.student_id}
+
+
+@router.post("/account-requests/{request_id}/reject")
+def reject_student_account_request(
+    request_id: int,
+    current_user: User = Depends(require_role(["ADMIN"])),
+    db: Session = Depends(get_db),
+):
+    account_request = db.query(StudentAccountRequest).filter(
+        StudentAccountRequest.id == request_id,
+        StudentAccountRequest.status == "pending",
+    ).first()
+    if not account_request:
+        raise HTTPException(status_code=404, detail="Pending account request not found.")
+    account_request.status = "rejected"
+    account_request.reviewed_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "rejected"}
 
 
 @router.get("/settings")
@@ -87,10 +208,8 @@ def update_score_settings(
     settings.threshold_attendance_pct = payload.threshold_attendance_pct
     settings.threshold_coding_score = payload.threshold_coding_score
     settings.updated_at = datetime.now(timezone.utc)
-    db.commit()
-
     # Recompute analytics pipeline with new weights
-    pipeline_res = run_full_analytics_pipeline(db)
+    pipeline_res = _run_pipeline_and_commit(db)
 
     return {
         "status": "success",
@@ -105,7 +224,7 @@ def trigger_recompute(
     db: Session = Depends(get_db)
 ):
     """Admin trigger to recompute all scoring, risk flags, ML predictions, and interventions."""
-    result = run_full_analytics_pipeline(db)
+    result = _run_pipeline_and_commit(db)
     return {"status": "success", "result": result}
 
 
@@ -118,6 +237,7 @@ async def upload_csv_files(
     placement: Optional[UploadFile] = File(None),
     skills: Optional[UploadFile] = File(None),
     feedback: Optional[UploadFile] = File(None),
+    import_mode: str = Form("partial"),
     current_user: User = Depends(require_role(["ADMIN"])),
     db: Session = Depends(get_db)
 ):
@@ -136,25 +256,44 @@ async def upload_csv_files(
     }
 
     uploaded_dfs = {}
+    total_bytes = 0
     for name, f in file_map.items():
         if f is not None and f.filename:
-            content = await f.read()
+            content = await _read_upload_limited(f, MAX_CSV_REQUEST_BYTES - total_bytes)
+            total_bytes += len(content)
             if content:
                 try:
-                    df = pd.read_csv(io.BytesIO(content))
+                    df = pd.read_csv(
+                        io.BytesIO(content),
+                        dtype=str,
+                        keep_default_na=False,
+                        encoding="utf-8-sig",
+                        on_bad_lines="error",
+                    )
                     uploaded_dfs[name] = df
-                except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Failed to parse CSV file '{f.filename}': {str(e)}")
+                except (pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"CSV file for '{name}' is malformed: {exc}",
+                    ) from exc
 
     if not uploaded_dfs:
         raise HTTPException(status_code=400, detail="Please upload at least one valid CSV file.")
 
-    res = ingest_seven_sources(uploaded_dfs, db)
+    res = ingest_seven_sources(uploaded_dfs, db, import_mode=import_mode)
     if res.get("status") == "error":
-        return Response(status_code=400, content=res.get("message", "Validation failed"))
+        raise HTTPException(
+            status_code=400,
+            detail={"message": res.get("message"), "errors": res.get("errors"), "counts": {
+                "accepted_rows": res.get("accepted_rows", 0),
+                "rejected_rows": res.get("rejected_rows", 0),
+                "duplicate_rows": res.get("duplicate_rows", 0),
+                "updated_rows": 0,
+            }},
+        )
 
     # Automatically recompute analytics
-    pipeline_res = run_full_analytics_pipeline(db)
+    pipeline_res = _run_pipeline_and_commit(db)
 
     return {
         "status": "success",
@@ -234,6 +373,6 @@ def get_ml_model_metrics(
     current_user: User = Depends(require_role(["ADMIN"])),
     db: Session = Depends(get_db)
 ):
-    """Screen 9: Gradient Boosting 5-fold cross-validated metrics and feature importances."""
+    """Screen 9: time-based held-out model metrics and feature importance."""
     metrics = get_model_metrics()
     return metrics

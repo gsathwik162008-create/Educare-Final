@@ -13,6 +13,18 @@ from app.routes_interventions import router as interventions_router
 from app.routes_admin import router as admin_router
 from app.llm import router as llm_router
 
+
+DEFAULT_CORS_ORIGINS = "http://localhost:8000,http://127.0.0.1:8000"
+cors_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
+    if origin.strip()
+]
+if not cors_origins:
+    cors_origins = DEFAULT_CORS_ORIGINS.split(",")
+if "*" in cors_origins:
+    raise RuntimeError("CORS_ALLOWED_ORIGINS must not contain the wildcard origin.")
+
 # Ensure tables exist
 Base.metadata.create_all(bind=engine)
 
@@ -39,7 +51,7 @@ app = FastAPI(
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
